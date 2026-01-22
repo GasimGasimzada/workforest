@@ -41,6 +41,7 @@ struct Agent {
     status: String,
     worktree_path: String,
     styles: Option<serde_json::Value>,
+    output: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -60,6 +61,13 @@ struct AddAgentRequest {
 struct ApiError {
     status: StatusCode,
     message: String,
+}
+
+#[derive(Serialize)]
+struct AgentOutput {
+    name: String,
+    status: String,
+    output: Option<String>,
 }
 
 impl ApiError {
@@ -105,6 +113,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/shutdown", get(shutdown))
         .route("/repos", get(list_repos).post(add_repo))
         .route("/agents", get(list_agents).post(add_agent))
+        .route("/agents/output", get(agents_output))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -179,6 +188,7 @@ async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<Agent>>, 
                 status: row.get(4)?,
                 worktree_path: row.get(5)?,
                 styles,
+                output: None,
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
             })
@@ -191,6 +201,73 @@ async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<Agent>>, 
     }
 
     Ok(Json(results))
+}
+
+async fn agents_output(State(state): State<AppState>) -> Result<Json<Vec<AgentOutput>>, ApiError> {
+    let conn = state.db.lock().await;
+    let mut stmt = conn
+        .prepare("SELECT name FROM agents ORDER BY created_at DESC")
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+
+    let agents = stmt
+        .query_map([], |row| Ok(row.get::<_, String>(0)?))
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+
+    let mut outputs = Vec::new();
+    for agent in agents {
+        let name = agent.map_err(|err| ApiError::internal(err.to_string()))?;
+        let status = tmux_session_status(&name);
+        let output = if status == "running" {
+            tmux_output(&name, 20)
+        } else {
+            None
+        };
+        outputs.push(AgentOutput {
+            name: name.clone(),
+            status,
+            output,
+        });
+    }
+
+    Ok(Json(outputs))
+}
+
+fn tmux_session_status(agent_name: &str) -> String {
+    let status = Command::new("tmux")
+        .args(["has-session", "-t", agent_name])
+        .stderr(Stdio::null())
+        .status();
+
+    match status {
+        Ok(status) if status.success() => "running".to_string(),
+        _ => "sleep".to_string(),
+    }
+}
+
+fn tmux_output(agent_name: &str, lines: usize) -> Option<String> {
+    if lines == 0 {
+        return None;
+    }
+
+    let start = format!("-{}", lines);
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", agent_name, "-S", &start])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let content = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
 }
 
 async fn add_agent(
@@ -226,6 +303,7 @@ async fn add_agent(
         status: "running".to_string(),
         worktree_path: worktree_path.to_string_lossy().to_string(),
         styles: None,
+        output: None,
         created_at: now.clone(),
         updated_at: now,
     };

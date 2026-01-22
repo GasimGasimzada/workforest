@@ -18,7 +18,7 @@ const ICON_IDLE: &str = "󰒲";
 const ICON_ERROR: &str = "󰅚";
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::{error::Error, io, time::Duration};
+use std::{collections::HashMap, error::Error, io, time::Duration};
 use workforest_core::RepoConfig;
 
 const THEME: Theme = Theme {
@@ -70,11 +70,19 @@ struct Agent {
     tool: String,
     status: String,
     worktree_path: String,
+    output: Option<String>,
 }
 
 #[derive(Serialize)]
 struct AddRepoRequest {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct AgentOutput {
+    name: String,
+    status: String,
+    output: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -121,8 +129,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut app = App::new(server_url);
     app.refresh_data();
+    let mut last_refresh = Instant::now();
 
     loop {
+        if last_refresh.elapsed() >= Duration::from_secs(5) {
+            app.refresh_data();
+            last_refresh = Instant::now();
+        }
+
         terminal.draw(|frame| draw(frame, &app))?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -167,6 +181,26 @@ impl App {
             self.status_message = Some(err);
             Vec::new()
         });
+        match fetch_agents_output(&self.client, &self.server_url) {
+            Ok(outputs) => {
+                for agent in &mut self.agents {
+                    if let Some(entry) = outputs.get(&agent.name) {
+                        agent.status = entry.status.clone();
+                        agent.output = entry.output.clone();
+                    } else {
+                        agent.status = "sleep".to_string();
+                        agent.output = None;
+                    }
+                }
+            }
+            Err(err) => {
+                self.status_message = Some(err);
+                for agent in &mut self.agents {
+                    agent.status = "sleep".to_string();
+                    agent.output = None;
+                }
+            }
+        }
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
@@ -369,7 +403,7 @@ fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let rows = (app.agents.len() + columns - 1) / columns;
     let mut row_constraints = Vec::new();
     for row in 0..rows {
-        row_constraints.push(Constraint::Length(7));
+        row_constraints.push(Constraint::Length(9));
         if row + 1 < rows {
             row_constraints.push(Constraint::Length(1));
         }
@@ -408,7 +442,16 @@ fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                 let name_line = build_name_line(agent, app.animation_start);
                 let repo_line =
                     Line::from(Span::styled(&agent.repo, Style::default().fg(THEME.fg_mid)));
-                let paragraph = Paragraph::new(vec![name_line, repo_line])
+                let mut lines = vec![name_line, repo_line];
+                if let Some(output) = agent.output.as_deref() {
+                    for line in output.lines() {
+                        lines.push(Line::from(Span::styled(
+                            line,
+                            Style::default().fg(THEME.fg_dim),
+                        )));
+                    }
+                }
+                let paragraph = Paragraph::new(lines)
                     .style(card_style)
                     .alignment(Alignment::Left);
                 frame.render_widget(paragraph, inner_area);
@@ -613,13 +656,30 @@ fn fetch_repos(client: &Client, server_url: &str) -> Result<Vec<RepoConfig>, Str
 
 fn fetch_agents(client: &Client, server_url: &str) -> Result<Vec<Agent>, String> {
     let url = format!("{}/agents", server_url);
-    let response = client.get(url).send().map_err(|err| err.to_string())?;
-    if !response.status().is_success() {
-        return Err(response
-            .text()
-            .unwrap_or_else(|_| "failed to load agents".to_string()));
-    }
-    response.json().map_err(|err| err.to_string())
+    client
+        .get(&url)
+        .send()
+        .map_err(|err| err.to_string())?
+        .json()
+        .map_err(|err| err.to_string())
+}
+
+fn fetch_agents_output(
+    client: &Client,
+    server_url: &str,
+) -> Result<HashMap<String, AgentOutput>, String> {
+    let url = format!("{}/agents/output", server_url);
+    let outputs = client
+        .get(&url)
+        .send()
+        .map_err(|err| err.to_string())?
+        .json::<Vec<AgentOutput>>()
+        .map_err(|err| err.to_string())?;
+
+    Ok(outputs
+        .into_iter()
+        .map(|entry| (entry.name.clone(), entry))
+        .collect())
 }
 
 fn add_repo(client: &Client, server_url: &str, path: &str) -> Result<RepoConfig, String> {
