@@ -1,14 +1,8 @@
 use clap::{Parser, Subcommand};
-use workforest_core::config_dir;
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use std::{
-    error::Error,
-    path::PathBuf,
-    process::Command,
-    thread,
-    time::Duration,
-};
+use std::{error::Error, path::PathBuf, process::Command, thread, time::Duration};
+use workforest_core::config_dir;
 
 #[derive(Parser)]
 #[command(name = "workforest")]
@@ -111,7 +105,11 @@ fn start_server() -> Result<(), Box<dyn Error>> {
 
 fn is_server_alive(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}/health", port);
-    Client::new().get(url).send().map(|resp| resp.status().is_success()).unwrap_or(false)
+    Client::new()
+        .get(url)
+        .send()
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false)
 }
 
 fn wait_for_server_shutdown() {
