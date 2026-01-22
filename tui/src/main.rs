@@ -6,11 +6,16 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout, Margin, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
     Terminal,
 };
+use std::time::Instant;
+use tachyonfx::{color_from_hsl, color_to_hsl};
+
+const ICON_IDLE: &str = "󰒲";
+const ICON_ERROR: &str = "󰅚";
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, io, time::Duration};
@@ -101,6 +106,7 @@ struct App {
     selected_tool: usize,
     agent_field: AgentField,
     status_message: Option<String>,
+    animation_start: Instant,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -148,6 +154,7 @@ impl App {
             selected_tool: 0,
             agent_field: AgentField::Repo,
             status_message: None,
+            animation_start: Instant::now(),
         }
     }
 
@@ -322,10 +329,10 @@ fn handle_show_repos_keys(app: &mut App, key: KeyEvent) {
 
 fn draw(frame: &mut ratatui::Frame, app: &App) {
     let background_style = Style::default().bg(THEME.bg);
-    frame.render_widget(Block::default().style(background_style), frame.size());
+    let area = frame.area();
+    frame.render_widget(Block::default().style(background_style), area);
 
-    let sections =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(frame.size());
+    let sections = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let padded = padded_rect(sections[0]);
 
     render_agents(frame, padded, app);
@@ -385,15 +392,6 @@ fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             let agent_index = row_index * columns + col_index;
             if let Some(agent) = app.agents.get(agent_index) {
                 let card_style = Style::default().bg(THEME.bg_alt).fg(THEME.fg);
-                let lines = vec![
-                    Line::from(Span::styled(&agent.label, Style::default().fg(THEME.fg))),
-                    Line::from(Span::styled(&agent.repo, Style::default().fg(THEME.fg_mid))),
-                    Line::from(Span::styled(
-                        &agent.status,
-                        Style::default().fg(THEME.fg_dim),
-                    )),
-                ];
-
                 let block = Block::default()
                     .borders(Borders::LEFT)
                     .border_style(Style::default().fg(THEME.green))
@@ -404,13 +402,16 @@ fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                         top: 1,
                         bottom: 1,
                     });
-                frame.render_widget(
-                    Paragraph::new(lines)
-                        .block(block)
-                        .style(card_style)
-                        .alignment(Alignment::Left),
-                    card_areas[col_index],
-                );
+                frame.render_widget(&block, card_areas[col_index]);
+
+                let inner_area = block.inner(card_areas[col_index]);
+                let name_line = build_name_line(agent, app.animation_start);
+                let repo_line =
+                    Line::from(Span::styled(&agent.repo, Style::default().fg(THEME.fg_mid)));
+                let paragraph = Paragraph::new(vec![name_line, repo_line])
+                    .style(card_style)
+                    .alignment(Alignment::Left);
+                frame.render_widget(paragraph, inner_area);
             }
         }
     }
@@ -533,6 +534,40 @@ fn render_show_repos_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
         .wrap(Wrap { trim: true })
         .style(Style::default().fg(THEME.fg_mid));
     frame.render_widget(paragraph, inner);
+}
+
+fn build_name_line(agent: &Agent, animation_start: Instant) -> Line<'static> {
+    match agent.status.as_str() {
+        "running" => {
+            let animated = animated_running_style(animation_start);
+            Line::from(Span::styled(
+                agent.label.clone(),
+                animated.add_modifier(Modifier::BOLD),
+            ))
+        }
+        "error" => icon_name_line(ICON_ERROR, THEME.red, &agent.label),
+        "idle" => icon_name_line(ICON_IDLE, THEME.blue, &agent.label),
+        _ => icon_name_line(ICON_IDLE, THEME.fg_dim, &agent.label),
+    }
+}
+
+fn icon_name_line(icon: &str, color: Color, label: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            label.to_string(),
+            Style::default().fg(THEME.fg).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(icon.to_string(), Style::default().fg(color)),
+    ])
+}
+
+fn animated_running_style(animation_start: Instant) -> Style {
+    let (hue, saturation, lightness) = color_to_hsl(&THEME.orange);
+    let elapsed = animation_start.elapsed().as_secs_f32();
+    let shifted_hue = (hue + (elapsed * 60.0)) % 360.0;
+    let color = color_from_hsl(shifted_hue, saturation, lightness);
+    Style::default().fg(color)
 }
 
 fn padded_rect(rect: Rect) -> Rect {

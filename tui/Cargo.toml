@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 workforest-core = { path = "../core" }
-ratatui = "0.27"
-crossterm = "0.27"
+ratatui = "0.30"
+crossterm = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
+tachyonfx = "0.22"
