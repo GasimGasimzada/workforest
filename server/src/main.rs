@@ -14,7 +14,7 @@ use std::{
     error::Error,
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
 };
 use tokio::sync::oneshot;
@@ -215,6 +215,7 @@ async fn add_agent(
     let agent_name = generate_unique_agent_name(state.db.clone()).await?;
     let label = agent_name.clone();
     let worktree_path = create_worktree(&repo.path, &repo.name, &agent_name)?;
+    start_tool_session(&agent_name, &request.tool, &worktree_path)?;
     let now = Utc::now().to_rfc3339();
 
     let agent = Agent {
@@ -222,7 +223,7 @@ async fn add_agent(
         label,
         repo: repo.name.clone(),
         tool: request.tool,
-        status: "idle".to_string(),
+        status: "running".to_string(),
         worktree_path: worktree_path.to_string_lossy().to_string(),
         styles: None,
         created_at: now.clone(),
@@ -394,6 +395,8 @@ fn create_worktree(
         .args(["worktree", "add", "-b"])
         .arg(&branch_name)
         .arg(&worktree_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map_err(|err| ApiError::internal(err.to_string()))?;
 
@@ -402,6 +405,26 @@ fn create_worktree(
     }
 
     Ok(worktree_path)
+}
+
+fn start_tool_session(agent_name: &str, tool: &str, worktree_path: &Path) -> Result<(), ApiError> {
+    let status = Command::new("tmux")
+        .args(["new-session", "-d", "-s"])
+        .arg(agent_name)
+        .arg("-c")
+        .arg(worktree_path)
+        .arg("--")
+        .arg("sh")
+        .arg("-lc")
+        .arg(tool)
+        .status()
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+
+    if !status.success() {
+        return Err(ApiError::internal("tmux session start failed"));
+    }
+
+    Ok(())
 }
 
 fn to_kebab(value: &str) -> String {
