@@ -19,10 +19,10 @@ use ratatui::{
     Terminal,
 };
 use std::time::Instant;
-use tachyonfx::{color_from_hsl, color_to_hsl};
 
 const ICON_IDLE: &str = "󰒲";
 const ICON_ERROR: &str = "󰅚";
+const ICON_ACTIVE: &str = "●";
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, error::Error, io, process::Command, time::Duration};
@@ -787,15 +787,14 @@ fn render_show_repos_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
 
 fn build_name_line(agent: &Agent, animation_start: Instant) -> Line<'static> {
     match agent.status.as_str() {
-        "running" => {
-            let animated = animated_running_style(animation_start);
-            Line::from(Span::styled(
-                agent.label.clone(),
-                animated.add_modifier(Modifier::BOLD),
-            ))
-        }
+        "running" => icon_name_line(
+            ICON_ACTIVE,
+            pulsing_green_color(animation_start),
+            &agent.label,
+        ),
         "error" => icon_name_line(ICON_ERROR, THEME.red, &agent.label),
         "idle" => icon_name_line(ICON_IDLE, THEME.blue, &agent.label),
+        "sleep" => icon_name_line(ICON_IDLE, THEME.fg_dim, &agent.label),
         _ => icon_name_line(ICON_IDLE, THEME.fg_dim, &agent.label),
     }
 }
@@ -811,12 +810,29 @@ fn icon_name_line(icon: &str, color: Color, label: &str) -> Line<'static> {
     ])
 }
 
-fn animated_running_style(animation_start: Instant) -> Style {
-    let (hue, saturation, lightness) = color_to_hsl(&THEME.orange);
+fn pulsing_green_color(animation_start: Instant) -> Color {
     let elapsed = animation_start.elapsed().as_secs_f32();
-    let shifted_hue = (hue + (elapsed * 60.0)) % 360.0;
-    let color = color_from_hsl(shifted_hue, saturation, lightness);
-    Style::default().fg(color)
+    let pulse = (elapsed * 2.0).sin().abs();
+    blend_color(THEME.green_dim, THEME.green, pulse)
+}
+
+fn blend_color(from: Color, to: Color, amount: f32) -> Color {
+    let clamped = amount.clamp(0.0, 1.0);
+    match (from, to) {
+        (Color::Rgb(from_r, from_g, from_b), Color::Rgb(to_r, to_g, to_b)) => {
+            let lerp_channel = |start: u8, end: u8| -> u8 {
+                let start = f32::from(start);
+                let end = f32::from(end);
+                (start + (end - start) * clamped).round() as u8
+            };
+            Color::Rgb(
+                lerp_channel(from_r, to_r),
+                lerp_channel(from_g, to_g),
+                lerp_channel(from_b, to_b),
+            )
+        }
+        _ => to,
+    }
 }
 
 fn padded_rect(rect: Rect) -> Rect {
