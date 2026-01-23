@@ -282,7 +282,7 @@ fn handle_root_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
                 app.set_status("no agents to open");
             } else {
                 let agent = &app.agents[app.selected_agent];
-                match open_agent_tmux(&agent.name) {
+                match open_agent_tmux(agent) {
                     Ok(needs_reset) => {
                         if needs_reset {
                             app.needs_terminal_reset = true;
@@ -321,10 +321,11 @@ fn handle_root_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
     Ok(false)
 }
 
-fn open_agent_tmux(agent_name: &str) -> Result<bool, Box<dyn Error>> {
+fn open_agent_tmux(agent: &Agent) -> Result<bool, Box<dyn Error>> {
+    ensure_tmux_session(agent)?;
     if env::var("TMUX").is_ok() {
         let status = Command::new("tmux")
-            .args(["switch-client", "-t", agent_name])
+            .args(["switch-client", "-t", agent.name.as_str()])
             .status()?;
         if !status.success() {
             return Err("tmux switch-client failed".into());
@@ -335,7 +336,7 @@ fn open_agent_tmux(agent_name: &str) -> Result<bool, Box<dyn Error>> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     let result = Command::new("tmux")
-        .args(["attach", "-t", agent_name])
+        .args(["attach", "-t", agent.name.as_str()])
         .status();
     enable_raw_mode()?;
     execute!(
@@ -351,6 +352,29 @@ fn open_agent_tmux(agent_name: &str) -> Result<bool, Box<dyn Error>> {
     }
 
     Ok(true)
+}
+
+fn ensure_tmux_session(agent: &Agent) -> Result<(), Box<dyn Error>> {
+    let status = Command::new("tmux")
+        .args(["has-session", "-t", agent.name.as_str()])
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+
+    let status = Command::new("tmux")
+        .args(["new-session", "-d", "-s"])
+        .arg(&agent.name)
+        .arg("-c")
+        .arg(&agent.worktree_path)
+        .args(["--", "sh", "-lc"])
+        .arg(&agent.tool)
+        .status()?;
+    if !status.success() {
+        return Err("tmux session start failed".into());
+    }
+
+    Ok(())
 }
 
 fn reset_terminal(
@@ -455,9 +479,22 @@ fn handle_add_agent_keys(app: &mut App, key: KeyEvent) -> Result<(), Box<dyn Err
                 .unwrap_or_else(|| repo.default_tool.clone());
 
             match add_agent(&app.client, &app.server_url, &repo.name, &tool) {
-                Ok(_) => {
+                Ok(agent) => {
                     app.refresh_data();
+                    if let Some(index) =
+                        app.agents.iter().position(|entry| entry.name == agent.name)
+                    {
+                        app.selected_agent = index;
+                    }
                     app.modal = Modal::None;
+                    match open_agent_tmux(&agent) {
+                        Ok(needs_reset) => {
+                            if needs_reset {
+                                app.needs_terminal_reset = true;
+                            }
+                        }
+                        Err(err) => app.set_status(err.to_string()),
+                    }
                 }
                 Err(err) => app.set_status(err),
             }
