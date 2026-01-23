@@ -41,6 +41,8 @@ const THEME: Theme = Theme {
     visual: Color::Rgb(42, 42, 42),
 };
 
+const AGENT_COLUMNS: usize = 3;
+
 struct Theme {
     bg: Color,
     bg_alt: Color,
@@ -112,6 +114,7 @@ struct App {
     input: String,
     selected_repo: usize,
     selected_tool: usize,
+    selected_agent: usize,
     agent_field: AgentField,
     status_message: Option<String>,
     animation_start: Instant,
@@ -166,6 +169,7 @@ impl App {
             input: String::new(),
             selected_repo: 0,
             selected_tool: 0,
+            selected_agent: 0,
             agent_field: AgentField::Repo,
             status_message: None,
             animation_start: Instant::now(),
@@ -181,6 +185,11 @@ impl App {
             self.status_message = Some(err);
             Vec::new()
         });
+        if self.agents.is_empty() {
+            self.selected_agent = 0;
+        } else if self.selected_agent >= self.agents.len() {
+            self.selected_agent = self.agents.len() - 1;
+        }
         match fetch_agents_output(&self.client, &self.server_url) {
             Ok(outputs) => {
                 for agent in &mut self.agents {
@@ -251,6 +260,29 @@ fn handle_root_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
         }
         KeyCode::Char('u') => {
             app.refresh_data();
+        }
+        KeyCode::Left => {
+            if app.selected_agent > 0 {
+                app.selected_agent -= 1;
+            }
+        }
+        KeyCode::Right => {
+            if app.selected_agent + 1 < app.agents.len() {
+                app.selected_agent += 1;
+            }
+        }
+        KeyCode::Up => {
+            if app.selected_agent >= AGENT_COLUMNS {
+                app.selected_agent -= AGENT_COLUMNS;
+            }
+        }
+        KeyCode::Down => {
+            let col = app.selected_agent % AGENT_COLUMNS;
+            let next_row_start = app.selected_agent - col + AGENT_COLUMNS;
+            if next_row_start < app.agents.len() {
+                let target = next_row_start + col;
+                app.selected_agent = target.min(app.agents.len() - 1);
+            }
         }
         _ => {}
     }
@@ -399,7 +431,7 @@ fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         return;
     }
 
-    let columns = 3;
+    let columns = AGENT_COLUMNS;
     let rows = (app.agents.len() + columns - 1) / columns;
     let mut row_constraints = Vec::new();
     for row in 0..rows {
@@ -426,9 +458,14 @@ fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             let agent_index = row_index * columns + col_index;
             if let Some(agent) = app.agents.get(agent_index) {
                 let card_style = Style::default().bg(THEME.bg_alt).fg(THEME.fg);
+                let border_color = if agent_index == app.selected_agent {
+                    THEME.magenta
+                } else {
+                    THEME.green
+                };
                 let block = Block::default()
                     .borders(Borders::LEFT)
-                    .border_style(Style::default().fg(THEME.green))
+                    .border_style(Style::default().fg(border_color))
                     .style(card_style)
                     .padding(Padding {
                         left: 1,
