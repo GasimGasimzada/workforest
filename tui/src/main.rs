@@ -100,11 +100,17 @@ struct AddAgentRequest {
     tool: String,
 }
 
+struct DeleteAgentTarget {
+    name: String,
+    label: String,
+}
+
 enum Modal {
     None,
     AddRepo,
     AddAgent,
     ShowRepos,
+    DeleteAgent,
 }
 
 enum AgentField {
@@ -127,6 +133,7 @@ struct App {
     status_message: Option<String>,
     animation_start: Instant,
     needs_terminal_reset: bool,
+    delete_agent: Option<DeleteAgentTarget>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -189,6 +196,7 @@ impl App {
             status_message: None,
             animation_start: Instant::now(),
             needs_terminal_reset: false,
+            delete_agent: None,
         }
     }
 
@@ -247,6 +255,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
         Modal::AddRepo => handle_add_repo_keys(app, key)?,
         Modal::AddAgent => handle_add_agent_keys(app, key)?,
         Modal::ShowRepos => handle_show_repos_keys(app, key),
+        Modal::DeleteAgent => handle_delete_agent_keys(app, key)?,
     }
 
     Ok(should_exit)
@@ -276,6 +285,17 @@ fn handle_root_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
         }
         KeyCode::Char('u') => {
             app.refresh_data();
+        }
+        KeyCode::Char('d') => {
+            if app.agents.is_empty() {
+                app.set_status("no agents to delete");
+            } else if let Some(agent) = app.agents.get(app.selected_agent) {
+                app.delete_agent = Some(DeleteAgentTarget {
+                    name: agent.name.clone(),
+                    label: agent.label.clone(),
+                });
+                app.modal = Modal::DeleteAgent;
+            }
         }
         KeyCode::Enter => {
             if app.agents.is_empty() {
@@ -512,6 +532,30 @@ fn handle_show_repos_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_delete_agent_keys(app: &mut App, key: KeyEvent) -> Result<(), Box<dyn Error>> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('n') => {
+            app.modal = Modal::None;
+            app.delete_agent = None;
+        }
+        KeyCode::Enter | KeyCode::Char('y') => {
+            if let Some(target) = app.delete_agent.take() {
+                match delete_agent(&app.client, &app.server_url, &target.name) {
+                    Ok(()) => {
+                        app.refresh_data();
+                        app.set_status(format!("deleted agent {}", target.label));
+                    }
+                    Err(err) => app.set_status(err),
+                }
+            }
+            app.modal = Modal::None;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let background_style = Style::default().bg(THEME.bg);
     let area = frame.area();
@@ -523,7 +567,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     render_agents(frame, padded, app);
 
     let footer = Paragraph::new(
-        "(a) add agent   (r) add repo   (l) show repos   (u) refresh   Enter open   (q) quit   Esc to close",
+        "(a) add agent   (d) delete agent   (r) add repo   (l) show repos   (u) refresh   Enter open   (q) quit   Esc to close",
     )
     .style(Style::default().fg(THEME.fg_dim))
     .alignment(Alignment::Left);
@@ -538,6 +582,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         Modal::AddRepo => render_add_repo_modal(frame, app, padded),
         Modal::AddAgent => render_add_agent_modal(frame, app, padded),
         Modal::ShowRepos => render_show_repos_modal(frame, app, padded),
+        Modal::DeleteAgent => render_delete_agent_modal(frame, app, padded),
     }
 }
 
@@ -763,6 +808,31 @@ fn render_add_agent_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
     frame.render_widget(hint, sections[1]);
 }
 
+fn render_delete_agent_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
+    let area = centered_rect(70, 30, base);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title("Delete agent")
+        .style(Style::default().bg(THEME.bg_alt2).fg(THEME.fg))
+        .border_style(Style::default().fg(THEME.border));
+    frame.render_widget(&block, area);
+
+    let inner = block.inner(area);
+    let label = app
+        .delete_agent
+        .as_ref()
+        .map(|agent| agent.label.as_str())
+        .unwrap_or("agent");
+    let text = format!(
+        "Delete agent {}?\n\nThis will close its tmux session, delete the worktree, and delete the agent.\n\nPress Enter to delete, Esc to cancel.",
+        label
+    );
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(THEME.fg_mid));
+    frame.render_widget(paragraph, inner);
+}
+
 fn render_show_repos_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
     let area = centered_rect(70, 50, base);
     frame.render_widget(Clear, area);
@@ -937,4 +1007,15 @@ fn add_agent(client: &Client, server_url: &str, repo: &str, tool: &str) -> Resul
             .unwrap_or_else(|_| "failed to add agent".to_string()));
     }
     response.json().map_err(|err| err.to_string())
+}
+
+fn delete_agent(client: &Client, server_url: &str, name: &str) -> Result<(), String> {
+    let url = format!("{}/agents/{}", server_url, name);
+    let response = client.delete(url).send().map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(response
+            .text()
+            .unwrap_or_else(|_| "failed to delete agent".to_string()));
+    }
+    Ok(())
 }

@@ -1,8 +1,8 @@
 use axum::{
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{delete, get},
     Json, Router,
 };
 use chrono::Utc;
@@ -113,6 +113,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/shutdown", get(shutdown))
         .route("/repos", get(list_repos).post(add_repo))
         .route("/agents", get(list_agents).post(add_agent))
+        .route("/agents/:name", delete(delete_agent))
         .route("/agents/output", get(agents_output))
         .with_state(state);
 
@@ -331,6 +332,40 @@ async fn add_agent(
     Ok(Json(agent))
 }
 
+async fn delete_agent(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let (repo_name, worktree_path) = {
+        let conn = state.db.lock().await;
+        conn.query_row(
+            "SELECT repo, worktree_path FROM agents WHERE name = ?1",
+            params![name.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => ApiError::not_found("agent not found"),
+            _ => ApiError::internal(err.to_string()),
+        })?
+    };
+
+    let config = load_repo_config()?;
+    let repo = config
+        .repos
+        .iter()
+        .find(|repo| repo.name == repo_name)
+        .ok_or_else(|| ApiError::not_found("repo not found for agent"))?;
+
+    stop_tmux_session(&name);
+    delete_worktree(&repo.path, Path::new(&worktree_path), &name)?;
+
+    let conn = state.db.lock().await;
+    conn.execute("DELETE FROM agents WHERE name = ?1", params![name.as_str()])
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn shutdown(State(state): State<AppState>) -> &'static str {
     let mut sender_guard = state.shutdown_sender.lock().await;
     if let Some(sender) = sender_guard.take() {
@@ -500,6 +535,51 @@ fn start_tool_session(agent_name: &str, tool: &str, worktree_path: &Path) -> Res
 
     if !status.success() {
         return Err(ApiError::internal("tmux session start failed"));
+    }
+
+    Ok(())
+}
+
+fn stop_tmux_session(agent_name: &str) {
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", agent_name])
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn delete_worktree(
+    repo_path: &Path,
+    worktree_path: &Path,
+    agent_name: &str,
+) -> Result<(), ApiError> {
+    if worktree_path.exists() {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["worktree", "remove", "-f"])
+            .arg(worktree_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+
+        if !status.success() {
+            return Err(ApiError::internal("git worktree remove failed"));
+        }
+    }
+
+    let branch_name = format!("agent/{}", to_kebab(agent_name));
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["branch", "-D", &branch_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    if worktree_path.exists() {
+        std::fs::remove_dir_all(worktree_path)
+            .map_err(|err| ApiError::internal(err.to_string()))?;
     }
 
     Ok(())
