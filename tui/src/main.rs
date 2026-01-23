@@ -8,7 +8,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Wrap,
+    },
     Terminal,
 };
 use std::time::Instant;
@@ -115,6 +118,7 @@ struct App {
     selected_repo: usize,
     selected_tool: usize,
     selected_agent: usize,
+    agent_scroll: usize,
     agent_field: AgentField,
     status_message: Option<String>,
     animation_start: Instant,
@@ -140,7 +144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             last_refresh = Instant::now();
         }
 
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| draw(frame, &mut app))?;
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
@@ -170,6 +174,7 @@ impl App {
             selected_repo: 0,
             selected_tool: 0,
             selected_agent: 0,
+            agent_scroll: 0,
             agent_field: AgentField::Repo,
             status_message: None,
             animation_start: Instant::now(),
@@ -393,7 +398,7 @@ fn handle_show_repos_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &App) {
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let background_style = Style::default().bg(THEME.bg);
     let area = frame.area();
     frame.render_widget(Block::default().style(background_style), area);
@@ -422,7 +427,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     }
 }
 
-fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     if app.agents.is_empty() {
         let empty = Paragraph::new("No agents yet. Press (a) to add one.")
             .style(Style::default().fg(THEME.fg_mid))
@@ -432,18 +437,53 @@ fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     }
 
     let columns = AGENT_COLUMNS;
-    let rows = (app.agents.len() + columns - 1) / columns;
+    let total_rows = (app.agents.len() + columns - 1) / columns;
+    let row_height = 9usize;
+    let row_gap = 1usize;
+    let visible_rows = ((area.height as usize + row_gap) / (row_height + row_gap)).max(1);
+    let scrollbar_needed = total_rows > visible_rows;
+    let grid_area = if scrollbar_needed && area.width > 1 {
+        Rect {
+            width: area.width - 1,
+            ..area
+        }
+    } else {
+        area
+    };
+
+    if total_rows <= visible_rows {
+        app.agent_scroll = 0;
+    } else {
+        let max_scroll = total_rows - visible_rows;
+        let selected_row = app.selected_agent / columns;
+        if selected_row < app.agent_scroll {
+            app.agent_scroll = selected_row;
+        } else if selected_row >= app.agent_scroll + visible_rows {
+            app.agent_scroll = selected_row + 1 - visible_rows;
+        }
+        app.agent_scroll = app.agent_scroll.min(max_scroll);
+    }
+
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let scrollbar_position = if max_scroll > 0 {
+        app.agent_scroll * (total_rows.saturating_sub(1)) / max_scroll
+    } else {
+        0
+    };
+
+    let start_row = app.agent_scroll;
+    let end_row = (start_row + visible_rows).min(total_rows);
     let mut row_constraints = Vec::new();
-    for row in 0..rows {
-        row_constraints.push(Constraint::Length(9));
-        if row + 1 < rows {
-            row_constraints.push(Constraint::Length(1));
+    for row in start_row..end_row {
+        row_constraints.push(Constraint::Length(row_height as u16));
+        if row + 1 < end_row {
+            row_constraints.push(Constraint::Length(row_gap as u16));
         }
     }
-    let row_areas = Layout::vertical(row_constraints).split(area);
+    let row_areas = Layout::vertical(row_constraints).split(grid_area);
 
-    for row_index in 0..rows {
-        let row_area = row_areas[row_index * 2];
+    for (visible_index, row_index) in (start_row..end_row).enumerate() {
+        let row_area = row_areas[visible_index * 2];
         let col_areas = Layout::horizontal([
             Constraint::Percentage(33),
             Constraint::Length(2),
@@ -494,6 +534,21 @@ fn render_agents(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                 frame.render_widget(paragraph, inner_area);
             }
         }
+    }
+
+    if scrollbar_needed {
+        let scrollbar_area = Rect {
+            x: area.x + area.width.saturating_sub(1),
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
+        let mut scrollbar_state = ScrollbarState::new(total_rows)
+            .position(scrollbar_position)
+            .viewport_content_length(visible_rows);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(THEME.fg_dim));
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 }
 
