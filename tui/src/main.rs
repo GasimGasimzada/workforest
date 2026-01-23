@@ -1,7 +1,11 @@
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    style::{Attribute, ResetColor, SetAttribute},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear as TermClear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -21,7 +25,7 @@ const ICON_IDLE: &str = "󰒲";
 const ICON_ERROR: &str = "󰅚";
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, error::Error, io, time::Duration};
+use std::{collections::HashMap, env, error::Error, io, process::Command, time::Duration};
 use workforest_core::RepoConfig;
 
 const THEME: Theme = Theme {
@@ -122,6 +126,7 @@ struct App {
     agent_field: AgentField,
     status_message: Option<String>,
     animation_start: Instant,
+    needs_terminal_reset: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -142,6 +147,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         if last_refresh.elapsed() >= Duration::from_secs(5) {
             app.refresh_data();
             last_refresh = Instant::now();
+        }
+
+        if app.needs_terminal_reset {
+            reset_terminal(&mut terminal)?;
+            app.needs_terminal_reset = false;
         }
 
         terminal.draw(|frame| draw(frame, &mut app))?;
@@ -178,6 +188,7 @@ impl App {
             agent_field: AgentField::Repo,
             status_message: None,
             animation_start: Instant::now(),
+            needs_terminal_reset: false,
         }
     }
 
@@ -266,6 +277,21 @@ fn handle_root_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
         KeyCode::Char('u') => {
             app.refresh_data();
         }
+        KeyCode::Enter => {
+            if app.agents.is_empty() {
+                app.set_status("no agents to open");
+            } else {
+                let agent = &app.agents[app.selected_agent];
+                match open_agent_tmux(&agent.name) {
+                    Ok(needs_reset) => {
+                        if needs_reset {
+                            app.needs_terminal_reset = true;
+                        }
+                    }
+                    Err(err) => app.set_status(err.to_string()),
+                }
+            }
+        }
         KeyCode::Left => {
             if app.selected_agent > 0 {
                 app.selected_agent -= 1;
@@ -293,6 +319,57 @@ fn handle_root_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
     }
 
     Ok(false)
+}
+
+fn open_agent_tmux(agent_name: &str) -> Result<bool, Box<dyn Error>> {
+    if env::var("TMUX").is_ok() {
+        let status = Command::new("tmux")
+            .args(["switch-client", "-t", agent_name])
+            .status()?;
+        if !status.success() {
+            return Err("tmux switch-client failed".into());
+        }
+        return Ok(false);
+    }
+
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+    let result = Command::new("tmux")
+        .args(["attach", "-t", agent_name])
+        .status();
+    enable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        TermClear(ClearType::All),
+        ResetColor,
+        SetAttribute(Attribute::Reset)
+    )?;
+    let status = result?;
+    if !status.success() {
+        return Err("tmux attach failed".into());
+    }
+
+    Ok(true)
+}
+
+fn reset_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<(), Box<dyn Error>> {
+    disable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        TermClear(ClearType::All),
+        ResetColor,
+        SetAttribute(Attribute::Reset)
+    )?;
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    *terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    terminal.clear()?;
+    Ok(())
 }
 
 fn handle_add_repo_keys(app: &mut App, key: KeyEvent) -> Result<(), Box<dyn Error>> {
@@ -409,7 +486,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     render_agents(frame, padded, app);
 
     let footer = Paragraph::new(
-        "(a) add agent   (r) add repo   (l) show repos   (u) refresh   (q) quit   Esc to close",
+        "(a) add agent   (r) add repo   (l) show repos   (u) refresh   Enter open   (q) quit   Esc to close",
     )
     .style(Style::default().fg(THEME.fg_dim))
     .alignment(Alignment::Left);
