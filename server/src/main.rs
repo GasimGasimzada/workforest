@@ -55,6 +55,7 @@ struct AddRepoRequest {
 struct AddAgentRequest {
     repo: String,
     tool: String,
+    name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -290,7 +291,27 @@ async fn add_agent(
         return Err(ApiError::bad_request("tool not configured for repo"));
     }
 
-    let agent_name = generate_unique_agent_name(state.db.clone()).await?;
+    let requested_name = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let agent_name = if let Some(name) = requested_name {
+        let conn = state.db.lock().await;
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE name = ?1)",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+        if exists {
+            return Err(ApiError::bad_request("agent name already exists"));
+        }
+        name.to_string()
+    } else {
+        generate_unique_agent_name(state.db.clone()).await?
+    };
     let label = agent_name.clone();
     let worktree_path = create_worktree(&repo.path, &repo.name, &agent_name)?;
     start_tool_session(&agent_name, &request.tool, &worktree_path)?;

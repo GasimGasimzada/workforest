@@ -23,6 +23,7 @@ use std::time::Instant;
 const ICON_IDLE: &str = "󰒲";
 const ICON_ERROR: &str = "󰅚";
 const ICON_ACTIVE: &str = "●";
+use petname::petname;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, error::Error, io, process::Command, time::Duration};
@@ -98,6 +99,7 @@ struct AgentOutput {
 struct AddAgentRequest {
     repo: String,
     tool: String,
+    name: Option<String>,
 }
 
 struct DeleteAgentTarget {
@@ -115,7 +117,9 @@ enum Modal {
 
 enum AgentField {
     Repo,
+    Name,
     Tool,
+    Create,
 }
 
 struct App {
@@ -125,6 +129,8 @@ struct App {
     repos: Vec<RepoConfig>,
     modal: Modal,
     input: String,
+    agent_name_input: String,
+    agent_filter_input: String,
     selected_repo: usize,
     selected_tool: usize,
     selected_agent: usize,
@@ -188,6 +194,8 @@ impl App {
             repos: Vec::new(),
             modal: Modal::None,
             input: String::new(),
+            agent_name_input: String::new(),
+            agent_filter_input: String::new(),
             selected_repo: 0,
             selected_tool: 0,
             selected_agent: 0,
@@ -261,6 +269,54 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
     Ok(should_exit)
 }
 
+fn filtered_repo_indices(app: &App) -> Vec<usize> {
+    let filter = app.agent_filter_input.trim().to_lowercase();
+    app.repos
+        .iter()
+        .enumerate()
+        .filter(|(_, repo)| filter.is_empty() || repo.name.to_lowercase().contains(&filter))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn filtered_tool_indices(app: &App) -> Vec<usize> {
+    let filter = app.agent_filter_input.trim().to_lowercase();
+    app.repos
+        .get(app.selected_repo)
+        .map(|repo| {
+            repo.tools
+                .iter()
+                .enumerate()
+                .filter(|(_, tool)| filter.is_empty() || tool.to_lowercase().contains(&filter))
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn sync_filtered_selection(app: &mut App) {
+    match app.agent_field {
+        AgentField::Repo => {
+            let indices = filtered_repo_indices(app);
+            if let Some(first) = indices.first() {
+                if !indices.contains(&app.selected_repo) {
+                    app.selected_repo = *first;
+                    app.selected_tool = default_tool_index(&app.repos[app.selected_repo]);
+                }
+            }
+        }
+        AgentField::Tool => {
+            let indices = filtered_tool_indices(app);
+            if let Some(first) = indices.first() {
+                if !indices.contains(&app.selected_tool) {
+                    app.selected_tool = *first;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_root_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
     match key.code {
         KeyCode::Char('q') => return Ok(true),
@@ -277,6 +333,9 @@ fn handle_root_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
                 app.selected_repo = app.selected_repo.min(app.repos.len() - 1);
                 app.selected_tool = default_tool_index(&app.repos[app.selected_repo]);
                 app.agent_field = AgentField::Repo;
+                app.agent_filter_input.clear();
+                app.agent_name_input = petname(2, "-");
+                sync_filtered_selection(app);
                 app.status_message = None;
             }
         }
@@ -452,71 +511,142 @@ fn handle_add_agent_keys(app: &mut App, key: KeyEvent) -> Result<(), Box<dyn Err
     match key.code {
         KeyCode::Esc => {
             app.modal = Modal::None;
+            app.agent_filter_input.clear();
         }
         KeyCode::Tab => {
-            app.agent_field = match app.agent_field {
-                AgentField::Repo => AgentField::Tool,
-                AgentField::Tool => AgentField::Repo,
+            let next_field = match app.agent_field {
+                AgentField::Repo => AgentField::Name,
+                AgentField::Name => AgentField::Tool,
+                AgentField::Tool => AgentField::Create,
+                AgentField::Create => AgentField::Repo,
             };
+            app.agent_field = next_field;
+            app.agent_filter_input.clear();
+            if matches!(app.agent_field, AgentField::Repo | AgentField::Tool) {
+                sync_filtered_selection(app);
+            }
         }
-        KeyCode::Up => {
-            if matches!(app.agent_field, AgentField::Repo) {
-                if app.selected_repo > 0 {
-                    app.selected_repo -= 1;
+        KeyCode::BackTab => {
+            let next_field = match app.agent_field {
+                AgentField::Repo => AgentField::Create,
+                AgentField::Name => AgentField::Repo,
+                AgentField::Tool => AgentField::Name,
+                AgentField::Create => AgentField::Tool,
+            };
+            app.agent_field = next_field;
+            app.agent_filter_input.clear();
+            if matches!(app.agent_field, AgentField::Repo | AgentField::Tool) {
+                sync_filtered_selection(app);
+            }
+        }
+        KeyCode::Up => match app.agent_field {
+            AgentField::Repo => {
+                let indices = filtered_repo_indices(app);
+                if let Some(current) = indices.iter().position(|index| *index == app.selected_repo)
+                {
+                    if current > 0 {
+                        app.selected_repo = indices[current - 1];
+                        app.selected_tool = default_tool_index(&app.repos[app.selected_repo]);
+                    }
+                } else if let Some(first) = indices.first() {
+                    app.selected_repo = *first;
                     app.selected_tool = default_tool_index(&app.repos[app.selected_repo]);
                 }
             }
-        }
-        KeyCode::Down => {
-            if matches!(app.agent_field, AgentField::Repo) {
-                if app.selected_repo + 1 < app.repos.len() {
-                    app.selected_repo += 1;
+            AgentField::Tool => {
+                let indices = filtered_tool_indices(app);
+                if let Some(current) = indices.iter().position(|index| *index == app.selected_tool)
+                {
+                    if current > 0 {
+                        app.selected_tool = indices[current - 1];
+                    }
+                } else if let Some(first) = indices.first() {
+                    app.selected_tool = *first;
+                }
+            }
+            _ => {}
+        },
+        KeyCode::Down => match app.agent_field {
+            AgentField::Repo => {
+                let indices = filtered_repo_indices(app);
+                if let Some(current) = indices.iter().position(|index| *index == app.selected_repo)
+                {
+                    if current + 1 < indices.len() {
+                        app.selected_repo = indices[current + 1];
+                        app.selected_tool = default_tool_index(&app.repos[app.selected_repo]);
+                    }
+                } else if let Some(first) = indices.first() {
+                    app.selected_repo = *first;
                     app.selected_tool = default_tool_index(&app.repos[app.selected_repo]);
                 }
             }
-        }
-        KeyCode::Left => {
-            if matches!(app.agent_field, AgentField::Tool) {
-                if app.selected_tool > 0 {
-                    app.selected_tool -= 1;
+            AgentField::Tool => {
+                let indices = filtered_tool_indices(app);
+                if let Some(current) = indices.iter().position(|index| *index == app.selected_tool)
+                {
+                    if current + 1 < indices.len() {
+                        app.selected_tool = indices[current + 1];
+                    }
+                } else if let Some(first) = indices.first() {
+                    app.selected_tool = *first;
                 }
             }
-        }
-        KeyCode::Right => {
-            if matches!(app.agent_field, AgentField::Tool) {
-                let tools_len = app.repos[app.selected_repo].tools.len();
-                if app.selected_tool + 1 < tools_len {
-                    app.selected_tool += 1;
-                }
-            }
-        }
-        KeyCode::Enter => {
-            let repo = &app.repos[app.selected_repo];
-            let tool = repo
-                .tools
-                .get(app.selected_tool)
-                .cloned()
-                .unwrap_or_else(|| repo.default_tool.clone());
+            _ => {}
+        },
+        KeyCode::Enter => match app.agent_field {
+            AgentField::Repo => {}
+            AgentField::Tool => {}
+            AgentField::Name => {}
+            AgentField::Create => {
+                let repo = &app.repos[app.selected_repo];
+                let tool = repo
+                    .tools
+                    .get(app.selected_tool)
+                    .cloned()
+                    .unwrap_or_else(|| repo.default_tool.clone());
+                let name = app.agent_name_input.trim();
+                let name = if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
 
-            match add_agent(&app.client, &app.server_url, &repo.name, &tool) {
-                Ok(agent) => {
-                    app.refresh_data();
-                    if let Some(index) =
-                        app.agents.iter().position(|entry| entry.name == agent.name)
-                    {
-                        app.selected_agent = index;
-                    }
-                    app.modal = Modal::None;
-                    match open_agent_tmux(&agent) {
-                        Ok(needs_reset) => {
-                            if needs_reset {
-                                app.needs_terminal_reset = true;
-                            }
+                match add_agent(&app.client, &app.server_url, &repo.name, &tool, name) {
+                    Ok(agent) => {
+                        app.refresh_data();
+                        if let Some(index) =
+                            app.agents.iter().position(|entry| entry.name == agent.name)
+                        {
+                            app.selected_agent = index;
                         }
-                        Err(err) => app.set_status(err.to_string()),
+                        app.modal = Modal::None;
+                        match open_agent_tmux(&agent) {
+                            Ok(needs_reset) => {
+                                if needs_reset {
+                                    app.needs_terminal_reset = true;
+                                }
+                            }
+                            Err(err) => app.set_status(err.to_string()),
+                        }
                     }
+                    Err(err) => app.set_status(err),
                 }
-                Err(err) => app.set_status(err),
+            }
+        },
+        KeyCode::Backspace => {
+            if matches!(app.agent_field, AgentField::Repo | AgentField::Tool) {
+                app.agent_filter_input.pop();
+                sync_filtered_selection(app);
+            } else if matches!(app.agent_field, AgentField::Name) {
+                app.agent_name_input.pop();
+            }
+        }
+        KeyCode::Char(value) => {
+            if matches!(app.agent_field, AgentField::Repo | AgentField::Tool) {
+                app.agent_filter_input.push(value);
+                sync_filtered_selection(app);
+            } else if matches!(app.agent_field, AgentField::Name) {
+                app.agent_name_input.push(value);
             }
         }
         _ => {}
@@ -729,7 +859,7 @@ fn render_add_repo_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
 }
 
 fn render_add_agent_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
-    let area = centered_rect(70, 50, base);
+    let area = centered_rect(70, 60, base);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .title("Add agent")
@@ -740,71 +870,220 @@ fn render_add_agent_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
 
     let sections = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(inner);
 
-    let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(sections[0]);
+    let repo_filtered = filtered_repo_indices(app);
+    let tool_filtered = filtered_tool_indices(app);
+    let repo_list_lines = 1 + repo_filtered.len().max(1);
+    let tool_list_lines = 1 + tool_filtered.len().max(1);
+    let repo_box_height = (repo_list_lines + 2) as u16;
+    let tool_box_height = (tool_list_lines + 2) as u16;
 
-    let repo_lines: Vec<String> = app
+    let mut constraints = Vec::new();
+    constraints.push(Constraint::Length(repo_box_height));
+    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(3));
+    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(tool_box_height));
+    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(3));
+    constraints.push(Constraint::Min(0));
+
+    let content_layout = Layout::vertical(constraints).split(sections[0]);
+    let mut index = 0;
+    let repo_rect = content_layout[index];
+    index += 1;
+    index += 1;
+    let name_rect = content_layout[index];
+    index += 1;
+    index += 1;
+    let tool_rect = content_layout[index];
+    index += 1;
+    index += 1;
+    let create_rect = content_layout[index];
+
+    let repo_name = app
         .repos
-        .iter()
-        .enumerate()
-        .map(|(index, repo)| {
-            let marker = if index == app.selected_repo {
-                if matches!(app.agent_field, AgentField::Repo) {
-                    ">"
-                } else {
-                    "*"
-                }
+        .get(app.selected_repo)
+        .map(|repo| repo.name.as_str())
+        .unwrap_or("No repos");
+    let repo_selected = matches!(app.agent_field, AgentField::Repo);
+    let repo_display = if repo_selected && !app.agent_filter_input.is_empty() {
+        app.agent_filter_input.as_str()
+    } else {
+        repo_name
+    };
+    let repo_border = if repo_selected {
+        THEME.fg
+    } else {
+        THEME.fg_mid
+    };
+    let repo_title = if repo_selected {
+        THEME.fg
+    } else {
+        THEME.fg_mid
+    };
+    let repo_text = if repo_selected {
+        THEME.fg
+    } else {
+        THEME.fg_dim
+    };
+    let repo_block = Block::bordered()
+        .title(Span::styled("Repository", Style::default().fg(repo_title)))
+        .style(Style::default().bg(THEME.bg_alt2).fg(THEME.fg))
+        .border_style(Style::default().fg(repo_border));
+    let mut repo_lines = Vec::new();
+    repo_lines.push(Line::from(Span::styled(
+        repo_display.to_string(),
+        Style::default().fg(repo_text),
+    )));
+    if repo_filtered.is_empty() {
+        repo_lines.push(Line::from(Span::styled(
+            "No matches",
+            Style::default().fg(THEME.fg_dim),
+        )));
+    } else {
+        for index in &repo_filtered {
+            let repo = &app.repos[*index];
+            let marker = if *index == app.selected_repo {
+                ">"
             } else {
                 " "
             };
-            format!("{} {}", marker, repo.name)
-        })
-        .collect();
+            let style = if *index == app.selected_repo {
+                Style::default().fg(THEME.fg)
+            } else {
+                Style::default().fg(THEME.fg_dim)
+            };
+            repo_lines.push(Line::from(Span::styled(
+                format!("{} {}", marker, repo.name),
+                style,
+            )));
+        }
+    }
+    let repo_content = Paragraph::new(repo_lines).block(repo_block);
+    frame.render_widget(repo_content, repo_rect);
 
-    let repo_block = Block::bordered()
-        .title("Repos")
+    let name_selected = matches!(app.agent_field, AgentField::Name);
+    let name_border = if name_selected {
+        THEME.fg
+    } else {
+        THEME.fg_mid
+    };
+    let name_title = if name_selected {
+        THEME.fg
+    } else {
+        THEME.fg_mid
+    };
+    let name_text = if name_selected {
+        THEME.fg
+    } else {
+        THEME.fg_dim
+    };
+    let name_block = Block::bordered()
+        .title(Span::styled("Agent name", Style::default().fg(name_title)))
         .style(Style::default().bg(THEME.bg_alt2).fg(THEME.fg))
-        .border_style(Style::default().fg(THEME.border));
-    frame.render_widget(
-        Paragraph::new(repo_lines.join("\n")).block(repo_block),
-        columns[0],
-    );
+        .border_style(Style::default().fg(name_border));
+    let name_content = Paragraph::new(app.agent_name_input.as_str())
+        .style(Style::default().fg(name_text))
+        .block(name_block);
+    frame.render_widget(name_content, name_rect);
 
-    let tool_lines: Vec<String> = app
+    let tool_name = app
         .repos
         .get(app.selected_repo)
-        .map(|repo| {
+        .and_then(|repo| {
             repo.tools
-                .iter()
-                .enumerate()
-                .map(|(index, tool)| {
-                    let marker = if index == app.selected_tool {
-                        if matches!(app.agent_field, AgentField::Tool) {
-                            ">"
-                        } else {
-                            "*"
-                        }
-                    } else {
-                        " "
-                    };
-                    format!("{} {}", marker, tool)
-                })
-                .collect()
+                .get(app.selected_tool)
+                .or_else(|| repo.tools.iter().find(|tool| *tool == &repo.default_tool))
+                .map(|tool| tool.as_str())
         })
-        .unwrap_or_else(Vec::new);
-
+        .unwrap_or("Default agent for repo");
+    let tool_selected = matches!(app.agent_field, AgentField::Tool);
+    let tool_display = if tool_selected && !app.agent_filter_input.is_empty() {
+        app.agent_filter_input.as_str()
+    } else {
+        tool_name
+    };
+    let tool_border = if tool_selected {
+        THEME.fg
+    } else {
+        THEME.fg_mid
+    };
+    let tool_title = if tool_selected {
+        THEME.fg
+    } else {
+        THEME.fg_mid
+    };
+    let tool_text = if tool_selected {
+        THEME.fg
+    } else {
+        THEME.fg_dim
+    };
     let tool_block = Block::bordered()
-        .title("Tools")
+        .title(Span::styled(
+            "Agent to use",
+            Style::default().fg(tool_title),
+        ))
         .style(Style::default().bg(THEME.bg_alt2).fg(THEME.fg))
-        .border_style(Style::default().fg(THEME.border));
-    frame.render_widget(
-        Paragraph::new(tool_lines.join("\n")).block(tool_block),
-        columns[1],
-    );
+        .border_style(Style::default().fg(tool_border));
+    let mut tool_lines = Vec::new();
+    tool_lines.push(Line::from(Span::styled(
+        tool_display.to_string(),
+        Style::default().fg(tool_text),
+    )));
+    if let Some(repo) = app.repos.get(app.selected_repo) {
+        if tool_filtered.is_empty() {
+            tool_lines.push(Line::from(Span::styled(
+                "No matches",
+                Style::default().fg(THEME.fg_dim),
+            )));
+        } else {
+            for index in &tool_filtered {
+                let tool = &repo.tools[*index];
+                let marker = if *index == app.selected_tool {
+                    ">"
+                } else {
+                    " "
+                };
+                let style = if *index == app.selected_tool {
+                    Style::default().fg(THEME.fg)
+                } else {
+                    Style::default().fg(THEME.fg_dim)
+                };
+                tool_lines.push(Line::from(Span::styled(
+                    format!("{} {}", marker, tool),
+                    style,
+                )));
+            }
+        }
+    }
+    let tool_content = Paragraph::new(tool_lines).block(tool_block);
+    frame.render_widget(tool_content, tool_rect);
 
-    let hint = Paragraph::new("Tab to switch, arrows to select, Enter to create, Esc to cancel")
-        .style(Style::default().fg(THEME.fg_dim))
-        .alignment(Alignment::Center);
+    let create_selected = matches!(app.agent_field, AgentField::Create);
+    let create_border = if create_selected {
+        Color::White
+    } else {
+        THEME.fg_mid
+    };
+    let create_text = if create_selected {
+        THEME.fg
+    } else {
+        THEME.fg_dim
+    };
+    let create_block = Block::bordered()
+        .style(Style::default().bg(THEME.bg_alt2).fg(create_text))
+        .border_style(Style::default().fg(create_border));
+    let create_content = Paragraph::new("Create agent")
+        .style(Style::default().fg(create_text))
+        .alignment(Alignment::Center)
+        .block(create_block);
+    frame.render_widget(create_content, create_rect);
+
+    let hint = Paragraph::new(
+        "Tab to switch, type to filter, Enter to select, Enter on Create agent to confirm, Esc to cancel",
+    )
+    .style(Style::default().fg(THEME.fg_dim))
+    .alignment(Alignment::Center);
     frame.render_widget(hint, sections[1]);
 }
 
@@ -991,13 +1270,20 @@ fn add_repo(client: &Client, server_url: &str, path: &str) -> Result<RepoConfig,
     response.json().map_err(|err| err.to_string())
 }
 
-fn add_agent(client: &Client, server_url: &str, repo: &str, tool: &str) -> Result<Agent, String> {
+fn add_agent(
+    client: &Client,
+    server_url: &str,
+    repo: &str,
+    tool: &str,
+    name: Option<String>,
+) -> Result<Agent, String> {
     let url = format!("{}/agents", server_url);
     let response = client
         .post(url)
         .json(&AddAgentRequest {
             repo: repo.to_string(),
             tool: tool.to_string(),
+            name,
         })
         .send()
         .map_err(|err| err.to_string())?;

@@ -3346,6 +3346,7 @@ name = "workforest-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "petname",
  "ratatui",
  "reqwest",
  "serde",
