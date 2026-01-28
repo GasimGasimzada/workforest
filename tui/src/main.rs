@@ -10,7 +10,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout, Margin, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -107,6 +107,11 @@ struct DeleteAgentTarget {
     label: String,
 }
 
+enum DeleteAgentAction {
+    Cancel,
+    Delete,
+}
+
 enum Modal {
     None,
     AddRepo,
@@ -140,6 +145,7 @@ struct App {
     animation_start: Instant,
     needs_terminal_reset: bool,
     delete_agent: Option<DeleteAgentTarget>,
+    delete_agent_action: DeleteAgentAction,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -205,6 +211,7 @@ impl App {
             animation_start: Instant::now(),
             needs_terminal_reset: false,
             delete_agent: None,
+            delete_agent_action: DeleteAgentAction::Cancel,
         }
     }
 
@@ -353,6 +360,7 @@ fn handle_root_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>
                     name: agent.name.clone(),
                     label: agent.label.clone(),
                 });
+                app.delete_agent_action = DeleteAgentAction::Cancel;
                 app.modal = Modal::DeleteAgent;
             }
         }
@@ -664,22 +672,34 @@ fn handle_show_repos_keys(app: &mut App, key: KeyEvent) {
 
 fn handle_delete_agent_keys(app: &mut App, key: KeyEvent) -> Result<(), Box<dyn Error>> {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('n') => {
+        KeyCode::Esc => {
             app.modal = Modal::None;
             app.delete_agent = None;
         }
-        KeyCode::Enter | KeyCode::Char('y') => {
-            if let Some(target) = app.delete_agent.take() {
-                match delete_agent(&app.client, &app.server_url, &target.name) {
-                    Ok(()) => {
-                        app.refresh_data();
-                        app.set_status(format!("deleted agent {}", target.label));
-                    }
-                    Err(err) => app.set_status(err),
-                }
-            }
-            app.modal = Modal::None;
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+            app.delete_agent_action = match app.delete_agent_action {
+                DeleteAgentAction::Cancel => DeleteAgentAction::Delete,
+                DeleteAgentAction::Delete => DeleteAgentAction::Cancel,
+            };
         }
+        KeyCode::Enter => match app.delete_agent_action {
+            DeleteAgentAction::Cancel => {
+                app.modal = Modal::None;
+                app.delete_agent = None;
+            }
+            DeleteAgentAction::Delete => {
+                if let Some(target) = app.delete_agent.take() {
+                    match delete_agent(&app.client, &app.server_url, &target.name) {
+                        Ok(()) => {
+                            app.refresh_data();
+                            app.set_status(format!("deleted agent {}", target.label));
+                        }
+                        Err(err) => app.set_status(err),
+                    }
+                }
+                app.modal = Modal::None;
+            }
+        },
         _ => {}
     }
 
@@ -1088,28 +1108,74 @@ fn render_add_agent_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
 }
 
 fn render_delete_agent_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
-    let area = centered_rect(70, 30, base);
-    frame.render_widget(Clear, area);
-    let block = Block::bordered()
-        .title("Delete agent")
-        .style(Style::default().bg(THEME.bg_alt2).fg(THEME.fg))
-        .border_style(Style::default().fg(THEME.border));
-    frame.render_widget(&block, area);
-
-    let inner = block.inner(area);
     let label = app
         .delete_agent
         .as_ref()
         .map(|agent| agent.label.as_str())
         .unwrap_or("agent");
-    let text = format!(
-        "Delete agent {}?\n\nThis will close its tmux session, delete the worktree, and delete the agent.\n\nPress Enter to delete, Esc to cancel.",
-        label
-    );
+
+    let area = centered_rect(26, 23, base);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(Line::from(vec![
+            Span::raw("Delete agent "),
+            Span::styled(label, Style::default().fg(THEME.orange)).add_modifier(Modifier::BOLD),
+            Span::raw("?")
+        ]).centered())
+        .style(Style::default().bg(THEME.bg_alt2).fg(THEME.fg))
+        .border_style(Style::default().fg(THEME.fg))
+        .padding(Padding::new(1, 1, 1, 1)); 
+    frame.render_widget(&block, area); 
+
+    let inner = block.inner(area);
+
+    let text = 
+        "This will close its tmux session, delete the worktree, and delete the agent.";
+    let sections = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
     let paragraph = Paragraph::new(text)
         .wrap(Wrap { trim: true })
+        .alignment(Alignment::Center)
         .style(Style::default().fg(THEME.fg_mid));
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(paragraph, sections[0]);
+
+    let button_layout =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(sections[1]);
+
+    let cancel_selected = matches!(app.delete_agent_action, DeleteAgentAction::Cancel);
+    let cancel_button_style = if cancel_selected { THEME.fg } else { THEME.fg_mid };
+
+    let cancel_block = Block::bordered()
+        .style(Style::default().bg(THEME.bg_alt2).fg(cancel_button_style))
+        .border_style(Style::default().fg(cancel_button_style));
+    let cancel_button = Paragraph::new("Cancel")
+        .style(Style::default().fg(cancel_button_style))
+        .alignment(Alignment::Center)
+        .block(cancel_block);
+    frame.render_widget(cancel_button, button_layout[0]);
+
+    let delete_selected = matches!(app.delete_agent_action, DeleteAgentAction::Delete);
+    let delete_button_style = if delete_selected { THEME.red } else { THEME.fg_mid };
+    let delete_block = Block::bordered()
+        .style(Style::default().bg(THEME.bg_alt2).fg(delete_button_style))
+        .border_style(Style::default().fg(delete_button_style));
+    let delete_button = Paragraph::new("Delete")
+        .style(Style::default().fg(delete_button_style))
+        .alignment(Alignment::Center)
+        .block(delete_block);
+    frame.render_widget(delete_button, button_layout[1]);
+
+    let hint = Paragraph::new("Tab or arrow keys to switch, Enter to confirm, Esc to cancel.")
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(THEME.fg_dim))
+        .alignment(Alignment::Center);
+    frame.render_widget(hint, sections[3]);
 }
 
 fn render_show_repos_modal(frame: &mut ratatui::Frame, app: &App, base: Rect) {
