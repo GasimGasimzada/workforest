@@ -146,14 +146,6 @@ fn handle_add_agent_keys(
                             app.selected_agent = index;
                         }
                         app.focused_window = None;
-                        match crate::open_agent_tmux(&agent) {
-                            Ok(needs_reset) => {
-                                if needs_reset {
-                                    app.needs_terminal_reset = true;
-                                }
-                            }
-                            Err(err) => app.set_status(err.to_string()),
-                        }
                     }
                     Err(err) => app.set_status(err),
                 }

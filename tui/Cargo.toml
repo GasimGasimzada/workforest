@@ -11,3 +11,5 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1.0", features = ["derive"] }
 tachyonfx = "0.22"
 petname = "1.1"
+termwiz = "0.23.3"
+nix = { version = "0.29", features = ["socket", "uio", "fs"] }

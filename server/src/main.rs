@@ -6,16 +6,23 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, SockaddrStorage};
 use petname::petname;
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
+    io::{BufRead, BufReader, IoSlice, Read, Write},
     net::SocketAddr,
+    os::fd::FromRawFd,
+    os::unix::io::AsRawFd,
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    thread,
 };
 use tokio::sync::oneshot;
 use workforest_core::{data_dir, repos_config_path, RepoConfig, RepoConfigFile};
@@ -24,6 +31,30 @@ use workforest_core::{data_dir, repos_config_path, RepoConfig, RepoConfigFile};
 struct AppState {
     shutdown_sender: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>,
     db: Arc<tokio::sync::Mutex<Connection>>,
+    pty_sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+}
+
+struct PtySession {
+    master: Box<dyn MasterPty + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    size: PtySize,
+    history: Arc<Mutex<VecDeque<u8>>>,
+    subscribers: Arc<Mutex<Vec<UnixStream>>>,
+    _history_handle: thread::JoinHandle<()>,
+}
+
+const HISTORY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
+struct PtyBroker {
+    socket_path: PathBuf,
+    _handle: thread::JoinHandle<()>,
+}
+
+impl Drop for PtyBroker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
 }
 
 #[derive(Serialize)]
@@ -103,10 +134,13 @@ impl IntoResponse for ApiError {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let db = init_database()?;
+    let db = Arc::new(tokio::sync::Mutex::new(init_database()?));
+    let pty_sessions = Arc::new(Mutex::new(HashMap::new()));
+    let broker = start_pty_broker(pty_sessions.clone(), db.clone())?;
     let state = AppState {
         shutdown_sender: Arc::new(tokio::sync::Mutex::new(Some(shutdown_sender))),
-        db: Arc::new(tokio::sync::Mutex::new(db)),
+        db: db.clone(),
+        pty_sessions,
     };
 
     let app = Router::new()
@@ -127,6 +161,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_graceful_shutdown(wait_for_shutdown(shutdown_receiver))
         .await?;
 
+    drop(broker);
     remove_metadata();
 
     Ok(())
@@ -218,57 +253,26 @@ async fn agents_output(State(state): State<AppState>) -> Result<Json<Vec<AgentOu
     let mut outputs = Vec::new();
     for agent in agents {
         let name = agent.map_err(|err| ApiError::internal(err.to_string()))?;
-        let status = tmux_session_status(&name);
-        let output = if status == "running" {
-            tmux_output(&name, 20)
-        } else {
-            None
-        };
+        let status = pty_session_status(&name, &state.pty_sessions);
         outputs.push(AgentOutput {
             name: name.clone(),
             status,
-            output,
+            output: None,
         });
     }
 
     Ok(Json(outputs))
 }
 
-fn tmux_session_status(agent_name: &str) -> String {
-    let status = Command::new("tmux")
-        .args(["has-session", "-t", agent_name])
-        .stderr(Stdio::null())
-        .status();
-
-    match status {
-        Ok(status) if status.success() => "running".to_string(),
-        _ => "sleep".to_string(),
-    }
-}
-
-fn tmux_output(agent_name: &str, lines: usize) -> Option<String> {
-    if lines == 0 {
-        return None;
-    }
-
-    let start = format!("-{}", lines);
-    let output = Command::new("tmux")
-        .args(["capture-pane", "-p", "-t", agent_name, "-S", &start])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let content = String::from_utf8_lossy(&output.stdout)
-        .trim_end()
-        .to_string();
-    if content.is_empty() {
-        None
+fn pty_session_status(
+    agent_name: &str,
+    sessions: &Arc<Mutex<HashMap<String, PtySession>>>,
+) -> String {
+    let sessions = sessions.lock().expect("pty sessions lock");
+    if sessions.contains_key(agent_name) {
+        "running".to_string()
     } else {
-        Some(content)
+        "sleep".to_string()
     }
 }
 
@@ -314,7 +318,12 @@ async fn add_agent(
     };
     let label = agent_name.clone();
     let worktree_path = create_worktree(&repo.path, &repo.name, &agent_name)?;
-    start_tool_session(&agent_name, &request.tool, &worktree_path)?;
+    start_tool_session(
+        &agent_name,
+        &request.tool,
+        &worktree_path,
+        &state.pty_sessions,
+    )?;
     let now = Utc::now().to_rfc3339();
 
     let agent = Agent {
@@ -377,7 +386,7 @@ async fn delete_agent(
         .find(|repo| repo.name == repo_name)
         .ok_or_else(|| ApiError::not_found("repo not found for agent"))?;
 
-    stop_tmux_session(&name);
+    stop_pty_session(&name, &state.pty_sessions);
     delete_worktree(&repo.path, Path::new(&worktree_path), &name)?;
 
     let conn = state.db.lock().await;
@@ -400,6 +409,231 @@ async fn wait_for_shutdown(mut shutdown_receiver: oneshot::Receiver<()>) {
         _ = tokio::signal::ctrl_c() => {},
         _ = &mut shutdown_receiver => {},
     }
+}
+
+fn start_pty_broker(
+    sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+    db: Arc<tokio::sync::Mutex<Connection>>,
+) -> Result<PtyBroker, Box<dyn Error>> {
+    let socket_path = data_dir().join("pty.sock");
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let sessions = sessions.clone();
+                    let db = db.clone();
+                    thread::spawn(move || {
+                        if let Err(err) = handle_pty_connection(stream, sessions, db) {
+                            eprintln!("pty broker error: {err}");
+                        }
+                    });
+                }
+                Err(err) => {
+                    eprintln!("pty broker accept error: {err}");
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(PtyBroker {
+        socket_path,
+        _handle: handle,
+    })
+}
+
+fn handle_pty_connection(
+    stream: UnixStream,
+    sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+    db: Arc<tokio::sync::Mutex<Connection>>,
+) -> Result<(), Box<dyn Error>> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let command = parts.next().unwrap_or("");
+        match command {
+            "ATTACH" => {
+                let agent = parts.next().unwrap_or("");
+                let response = attach_pty(agent, &stream, &sessions, &db);
+                if let Err(err) = response {
+                    let _ = write_response(&stream, &format!("ERR {err}\n"));
+                }
+            }
+            "RESIZE" => {
+                let agent = parts.next().unwrap_or("");
+                let cols = parts.next().and_then(|value| value.parse::<u16>().ok());
+                let rows = parts.next().and_then(|value| value.parse::<u16>().ok());
+                match (cols, rows) {
+                    (Some(cols), Some(rows)) => {
+                        let result = resize_pty(agent, cols, rows, &sessions);
+                        let _ = if result.is_ok() {
+                            write_response(&stream, "OK\n")
+                        } else {
+                            write_response(&stream, "ERR resize failed\n")
+                        };
+                    }
+                    _ => {
+                        let _ = write_response(&stream, "ERR invalid resize\n");
+                    }
+                }
+            }
+            "INPUT" => {
+                let agent = parts.next().unwrap_or("");
+                let len = parts.next().and_then(|value| value.parse::<usize>().ok());
+                match len {
+                    Some(len) => {
+                        let mut payload = vec![0u8; len];
+                        if len > 0 {
+                            if let Err(err) = reader.read_exact(&mut payload) {
+                                let _ = write_response(&stream, &format!("ERR {err}\n"));
+                                continue;
+                            }
+                        }
+                        let result = ensure_pty_session(agent, &db, &sessions)
+                            .map_err(|err| err.to_string())
+                            .and_then(|_| write_pty_input(agent, &payload, &sessions));
+                        let _ = if result.is_ok() {
+                            write_response(&stream, "OK\n")
+                        } else {
+                            write_response(&stream, "ERR input failed\n")
+                        };
+                    }
+                    _ => {
+                        let _ = write_response(&stream, "ERR invalid input\n");
+                    }
+                }
+            }
+            _ => {
+                let _ = write_response(&stream, "ERR unknown command\n");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_pty_session(
+    agent: &str,
+    db: &Arc<tokio::sync::Mutex<Connection>>,
+    sessions: &Arc<Mutex<HashMap<String, PtySession>>>,
+) -> Result<(), String> {
+    {
+        let sessions = sessions.lock().expect("pty sessions lock");
+        if sessions.contains_key(agent) {
+            return Ok(());
+        }
+    }
+
+    let (tool, worktree_path) = {
+        let conn = db.blocking_lock();
+        conn.query_row(
+            "SELECT tool, worktree_path FROM agents WHERE name = ?1",
+            params![agent],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|err| err.to_string())?
+    };
+
+    start_tool_session(agent, &tool, Path::new(&worktree_path), sessions).map_err(|err| err.message)
+}
+
+fn attach_pty(
+    agent: &str,
+    stream: &UnixStream,
+    sessions: &Arc<Mutex<HashMap<String, PtySession>>>,
+    db: &Arc<tokio::sync::Mutex<Connection>>,
+) -> Result<(), Box<dyn Error>> {
+    if agent.trim().is_empty() {
+        return Err("agent name required".into());
+    }
+
+    ensure_pty_session(agent, db, sessions)?;
+
+    let (history, client_stream) = {
+        let mut sessions = sessions.lock().expect("pty sessions lock");
+        let session = sessions.get_mut(agent).ok_or("agent not found")?;
+        let history = session.history.lock().expect("pty history lock");
+        let bytes: Vec<u8> = history.iter().copied().collect();
+        let (server_stream, client_stream) = UnixStream::pair()?;
+        session
+            .subscribers
+            .lock()
+            .expect("pty subscribers lock")
+            .push(server_stream);
+        (bytes, client_stream)
+    };
+
+    write_response(stream, &format!("HISTORY {}\n", history.len()))?;
+    if !history.is_empty() {
+        let mut stream = stream.try_clone()?;
+        stream.write_all(&history)?;
+    }
+
+    let client_fd = client_stream.as_raw_fd();
+    sendmsg(
+        stream.as_raw_fd(),
+        &[IoSlice::new(b"OK\n")],
+        &[ControlMessage::ScmRights(&[client_fd])],
+        MsgFlags::empty(),
+        None::<&SockaddrStorage>,
+    )?;
+    Ok(())
+}
+
+fn resize_pty(
+    agent: &str,
+    cols: u16,
+    rows: u16,
+    sessions: &Arc<Mutex<HashMap<String, PtySession>>>,
+) -> Result<(), Box<dyn Error>> {
+    let mut sessions = sessions.lock().expect("pty sessions lock");
+    let session = sessions
+        .get_mut(agent)
+        .ok_or_else(|| "agent not found".to_string())?;
+    let size = PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    session.master.resize(size)?;
+    session.size = size;
+    Ok(())
+}
+
+fn write_pty_input(
+    agent: &str,
+    payload: &[u8],
+    sessions: &Arc<Mutex<HashMap<String, PtySession>>>,
+) -> Result<(), String> {
+    let mut sessions = sessions.lock().expect("pty sessions lock");
+    let session = sessions
+        .get_mut(agent)
+        .ok_or_else(|| "agent not found".to_string())?;
+    let mut writer = session.writer.lock().expect("pty writer lock");
+    writer.write_all(payload).map_err(|err| err.to_string())?;
+    writer.flush().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn write_response(stream: &UnixStream, response: &str) -> Result<(), Box<dyn Error>> {
+    let mut stream = stream.try_clone()?;
+    stream.write_all(response.as_bytes())?;
+    Ok(())
 }
 
 fn init_database() -> Result<Connection, Box<dyn Error>> {
@@ -541,31 +775,94 @@ fn create_worktree(
     Ok(worktree_path)
 }
 
-fn start_tool_session(agent_name: &str, tool: &str, worktree_path: &Path) -> Result<(), ApiError> {
-    let status = Command::new("tmux")
-        .args(["new-session", "-d", "-s"])
-        .arg(agent_name)
-        .arg("-c")
-        .arg(worktree_path)
-        .arg("--")
-        .arg("sh")
-        .arg("-lc")
-        .arg(tool)
-        .status()
+fn start_tool_session(
+    agent_name: &str,
+    tool: &str,
+    worktree_path: &Path,
+    sessions: &Arc<Mutex<HashMap<String, PtySession>>>,
+) -> Result<(), ApiError> {
+    let mut sessions = sessions.lock().expect("pty sessions lock");
+    if sessions.contains_key(agent_name) {
+        return Ok(());
+    }
+
+    let pty_system = native_pty_system();
+    let size = PtySize::default();
+    let pair = pty_system
+        .openpty(size)
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    let mut cmd = CommandBuilder::new("sh");
+    cmd.arg("-lc");
+    cmd.arg(tool);
+    cmd.cwd(worktree_path);
+    let child = pair
+        .slave
+        .spawn_command(cmd)
         .map_err(|err| ApiError::internal(err.to_string()))?;
 
-    if !status.success() {
-        return Err(ApiError::internal("tmux session start failed"));
-    }
+    let history = Arc::new(Mutex::new(VecDeque::new()));
+    let subscribers = Arc::new(Mutex::new(Vec::new()));
+    let master_fd = pair
+        .master
+        .as_raw_fd()
+        .ok_or_else(|| ApiError::internal("missing master fd"))?;
+    let history_handle = spawn_history_reader(master_fd, history.clone(), subscribers.clone());
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    sessions.insert(
+        agent_name.to_string(),
+        PtySession {
+            master: pair.master,
+            writer: Arc::new(Mutex::new(writer)),
+            child,
+            size,
+            history,
+            subscribers,
+            _history_handle: history_handle,
+        },
+    );
 
     Ok(())
 }
 
-fn stop_tmux_session(agent_name: &str) {
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t", agent_name])
-        .stderr(Stdio::null())
-        .status();
+fn stop_pty_session(agent_name: &str, sessions: &Arc<Mutex<HashMap<String, PtySession>>>) {
+    let mut sessions = sessions.lock().expect("pty sessions lock");
+    if let Some(mut session) = sessions.remove(agent_name) {
+        let _ = session.child.kill();
+    }
+}
+
+fn spawn_history_reader(
+    fd: i32,
+    history: Arc<Mutex<VecDeque<u8>>>,
+    subscribers: Arc<Mutex<Vec<UnixStream>>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut buffer = [0u8; 4096];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    {
+                        let mut history = history.lock().expect("pty history lock");
+                        for byte in &buffer[..size] {
+                            history.push_back(*byte);
+                        }
+                        while history.len() > HISTORY_LIMIT_BYTES {
+                            history.pop_front();
+                        }
+                    }
+                    let mut subs = subscribers.lock().expect("pty subscribers lock");
+                    subs.retain_mut(|stream| stream.write_all(&buffer[..size]).is_ok());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    })
 }
 
 fn delete_worktree(

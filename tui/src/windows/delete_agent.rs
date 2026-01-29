@@ -91,7 +91,7 @@ fn render_delete_agent_window(frame: &mut Frame, app: &App, base: Rect) {
 
     let inner = block.inner(area);
 
-    let text = "This will close its tmux session, delete the worktree, and delete the agent.";
+    let text = "This will close its session, delete the worktree, and delete the agent.";
     let sections = Layout::vertical([
         Constraint::Length(4),
         Constraint::Length(3),
