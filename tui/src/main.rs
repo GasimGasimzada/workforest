@@ -1263,3 +1263,14 @@ fn delete_agent(client: &Client, server_url: &str, name: &str) -> Result<(), Str
     }
     Ok(())
 }
+
+fn restart_agent(client: &Client, server_url: &str, name: &str) -> Result<(), String> {
+    let url = format!("{}/agents/{}/restart", server_url, name);
+    let response = client.post(url).send().map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(response
+            .text()
+            .unwrap_or_else(|_| "failed to restart agent".to_string()));
+    }
+    Ok(())
+}

@@ -2,7 +2,7 @@ use axum::{
     extract::{Path as AxumPath, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::Utc;
@@ -149,6 +149,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/repos", get(list_repos).post(add_repo))
         .route("/agents", get(list_agents).post(add_agent))
         .route("/agents/:name", delete(delete_agent))
+        .route("/agents/:name/restart", post(restart_agent))
         .route("/agents/output", get(agents_output))
         .with_state(state);
 
@@ -392,6 +393,37 @@ async fn delete_agent(
     let conn = state.db.lock().await;
     conn.execute("DELETE FROM agents WHERE name = ?1", params![name.as_str()])
         .map_err(|err| ApiError::internal(err.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn restart_agent(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let (tool, worktree_path) = {
+        let conn = state.db.lock().await;
+        conn.query_row(
+            "SELECT tool, worktree_path FROM agents WHERE name = ?1",
+            params![name.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => ApiError::not_found("agent not found"),
+            _ => ApiError::internal(err.to_string()),
+        })?
+    };
+
+    stop_pty_session(&name, &state.pty_sessions);
+    start_tool_session(&name, &tool, Path::new(&worktree_path), &state.pty_sessions)?;
+
+    let now = Utc::now().to_rfc3339();
+    let conn = state.db.lock().await;
+    conn.execute(
+        "UPDATE agents SET status = ?1, updated_at = ?2 WHERE name = ?3",
+        params!["running", now, name.as_str()],
+    )
+    .map_err(|err| ApiError::internal(err.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }

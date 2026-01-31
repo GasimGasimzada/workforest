@@ -77,6 +77,18 @@ fn handle_root_keys(
                 app.focused_window = Some(super::WindowId::DeleteAgent);
             }
         }
+        KeyCode::Char('R') => {
+            if app.agents.is_empty() {
+                app.set_status("no agents to restart");
+            } else if let Some(agent) = app.agents.get(app.selected_agent) {
+                match crate::restart_agent(&app.client, &app.server_url, &agent.name) {
+                    Ok(()) => {
+                        app.pty_views.remove(&agent.name);
+                    }
+                    Err(err) => app.set_status(err),
+                }
+            }
+        }
         KeyCode::Enter => {
             if let Some(agent) = app.agents.get(app.selected_agent) {
                 app.focused_agent = Some(agent.name.clone());
