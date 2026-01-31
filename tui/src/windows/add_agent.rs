@@ -3,7 +3,6 @@ use crate::{
     add_agent, default_tool_index, filtered_repo_indices, filtered_tool_indices,
     sync_filtered_selection, AgentField, App,
 };
-use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Style},
@@ -12,6 +11,7 @@ use ratatui::{
     Frame,
 };
 use std::error::Error;
+use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 
 use super::Window;
 
@@ -22,22 +22,29 @@ impl Window for AddAgentWindow {
         render_add_agent_window(frame, app, area);
     }
 
-    fn handle_key_event(
-        app: &mut App,
-        key: crossterm::event::KeyEvent,
-    ) -> Result<bool, Box<dyn Error>> {
+    fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
         handle_add_agent_keys(app, key)
     }
 }
 
-fn handle_add_agent_keys(
-    app: &mut App,
-    key: crossterm::event::KeyEvent,
-) -> Result<bool, Box<dyn Error>> {
-    match key.code {
-        KeyCode::Esc => {
+fn handle_add_agent_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
+    match key.key {
+        KeyCode::Escape => {
             app.focused_window = None;
             app.agent_filter_input.clear();
+        }
+        KeyCode::Tab if key.modifiers.contains(Modifiers::SHIFT) => {
+            let next_field = match app.agent_field {
+                AgentField::Repo => AgentField::Create,
+                AgentField::Name => AgentField::Repo,
+                AgentField::Tool => AgentField::Name,
+                AgentField::Create => AgentField::Tool,
+            };
+            app.agent_field = next_field;
+            app.agent_filter_input.clear();
+            if matches!(app.agent_field, AgentField::Repo | AgentField::Tool) {
+                sync_filtered_selection(app);
+            }
         }
         KeyCode::Tab => {
             let next_field = match app.agent_field {
@@ -52,20 +59,7 @@ fn handle_add_agent_keys(
                 sync_filtered_selection(app);
             }
         }
-        KeyCode::BackTab => {
-            let next_field = match app.agent_field {
-                AgentField::Repo => AgentField::Create,
-                AgentField::Name => AgentField::Repo,
-                AgentField::Tool => AgentField::Name,
-                AgentField::Create => AgentField::Tool,
-            };
-            app.agent_field = next_field;
-            app.agent_filter_input.clear();
-            if matches!(app.agent_field, AgentField::Repo | AgentField::Tool) {
-                sync_filtered_selection(app);
-            }
-        }
-        KeyCode::Up => match app.agent_field {
+        KeyCode::UpArrow => match app.agent_field {
             AgentField::Repo => {
                 let indices = filtered_repo_indices(app);
                 if let Some(current) = indices.iter().position(|index| *index == app.selected_repo)
@@ -92,7 +86,7 @@ fn handle_add_agent_keys(
             }
             _ => {}
         },
-        KeyCode::Down => match app.agent_field {
+        KeyCode::DownArrow => match app.agent_field {
             AgentField::Repo => {
                 let indices = filtered_repo_indices(app);
                 if let Some(current) = indices.iter().position(|index| *index == app.selected_repo)

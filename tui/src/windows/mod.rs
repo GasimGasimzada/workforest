@@ -1,11 +1,12 @@
 use crate::App;
-use crossterm::event::KeyEvent;
 use ratatui::{layout::Rect, Frame};
 use std::error::Error;
+use termwiz::input::KeyEvent;
 
 pub mod add_agent;
 pub mod add_repo;
 pub mod delete_agent;
+pub mod restart_agent;
 pub mod root;
 pub mod show_repos;
 
@@ -16,6 +17,7 @@ pub enum WindowId {
     AddAgent,
     ShowRepos,
     DeleteAgent,
+    RestartAgent,
 }
 
 pub trait Window {
@@ -32,6 +34,9 @@ pub fn render_window(id: WindowId, frame: &mut Frame, app: &mut App, area: Rect)
         WindowId::DeleteAgent => {
             <delete_agent::DeleteAgentWindow as Window>::render(frame, app, area)
         }
+        WindowId::RestartAgent => {
+            <restart_agent::RestartAgentWindow as Window>::render(frame, app, area)
+        }
     }
 }
 
@@ -47,6 +52,9 @@ pub fn handle_window_key_event(
         WindowId::ShowRepos => <show_repos::ShowReposWindow as Window>::handle_key_event(app, key),
         WindowId::DeleteAgent => {
             <delete_agent::DeleteAgentWindow as Window>::handle_key_event(app, key)
+        }
+        WindowId::RestartAgent => {
+            <restart_agent::RestartAgentWindow as Window>::handle_key_event(app, key)
         }
     }
 }

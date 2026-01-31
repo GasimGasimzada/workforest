@@ -1,6 +1,5 @@
 use crate::theme::THEME;
 use crate::App;
-use crossterm::event::KeyCode;
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -8,6 +7,7 @@ use ratatui::{
     Frame,
 };
 use std::error::Error;
+use termwiz::input::{KeyCode, KeyEvent};
 
 use super::Window;
 
@@ -18,20 +18,14 @@ impl Window for ShowReposWindow {
         render_show_repos_window(frame, app, area);
     }
 
-    fn handle_key_event(
-        app: &mut App,
-        key: crossterm::event::KeyEvent,
-    ) -> Result<bool, Box<dyn Error>> {
+    fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
         handle_show_repos_keys(app, key)
     }
 }
 
-fn handle_show_repos_keys(
-    app: &mut App,
-    key: crossterm::event::KeyEvent,
-) -> Result<bool, Box<dyn Error>> {
-    match key.code {
-        KeyCode::Esc | KeyCode::Enter => app.focused_window = None,
+fn handle_show_repos_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
+    match key.key {
+        KeyCode::Escape | KeyCode::Enter => app.focused_window = None,
         _ => {}
     }
     Ok(false)

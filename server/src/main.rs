@@ -7,6 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, SockaddrStorage};
+use num_traits::ToPrimitive;
 use petname::petname;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use rusqlite::{params, Connection};
@@ -24,8 +25,18 @@ use std::{
     sync::{Arc, Mutex},
     thread,
 };
+use termwiz::escape::csi::{
+    Cursor, CursorStyle, DecPrivateMode, DecPrivateModeCode, Mode, Sgr, TerminalMode,
+    TerminalModeCode,
+};
+use termwiz::escape::esc::EscCode;
+use termwiz::escape::{parser::Parser, Action, Esc};
 use tokio::sync::oneshot;
-use workforest_core::{data_dir, repos_config_path, RepoConfig, RepoConfigFile};
+use workforest_core::{
+    data_dir, repos_config_path, CursorShape, ModeEntry, RepoConfig, RepoConfigFile, ScrollRegion,
+    TerminalAttributes, TerminalBlink, TerminalColor, TerminalIntensity, TerminalSnapshot,
+    TerminalUnderline,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -40,6 +51,7 @@ struct PtySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     size: PtySize,
     history: Arc<Mutex<VecDeque<u8>>>,
+    terminal_snapshot: Arc<Mutex<TerminalSnapshot>>,
     subscribers: Arc<Mutex<Vec<UnixStream>>>,
     _history_handle: thread::JoinHandle<()>,
 }
@@ -595,20 +607,27 @@ fn attach_pty(
 
     ensure_pty_session(agent, db, sessions)?;
 
-    let (history, client_stream) = {
+    let (history, snapshot, client_stream) = {
         let mut sessions = sessions.lock().expect("pty sessions lock");
         let session = sessions.get_mut(agent).ok_or("agent not found")?;
         let history = session.history.lock().expect("pty history lock");
         let bytes: Vec<u8> = history.iter().copied().collect();
+        let snapshot = session
+            .terminal_snapshot
+            .lock()
+            .expect("pty terminal snapshot lock")
+            .clone();
         let (server_stream, client_stream) = UnixStream::pair()?;
         session
             .subscribers
             .lock()
             .expect("pty subscribers lock")
             .push(server_stream);
-        (bytes, client_stream)
+        (bytes, snapshot, client_stream)
     };
 
+    let snapshot_json = serde_json::to_string(&snapshot)?;
+    write_response(stream, &format!("MODES {}\n", snapshot_json))?;
     write_response(stream, &format!("HISTORY {}\n", history.len()))?;
     if !history.is_empty() {
         let mut stream = stream.try_clone()?;
@@ -833,12 +852,18 @@ fn start_tool_session(
         .map_err(|err| ApiError::internal(err.to_string()))?;
 
     let history = Arc::new(Mutex::new(VecDeque::new()));
+    let terminal_snapshot = Arc::new(Mutex::new(default_terminal_snapshot()));
     let subscribers = Arc::new(Mutex::new(Vec::new()));
     let master_fd = pair
         .master
         .as_raw_fd()
         .ok_or_else(|| ApiError::internal("missing master fd"))?;
-    let history_handle = spawn_history_reader(master_fd, history.clone(), subscribers.clone());
+    let history_handle = spawn_history_reader(
+        master_fd,
+        history.clone(),
+        terminal_snapshot.clone(),
+        subscribers.clone(),
+    );
     let writer = pair
         .master
         .take_writer()
@@ -851,6 +876,7 @@ fn start_tool_session(
             child,
             size,
             history,
+            terminal_snapshot,
             subscribers,
             _history_handle: history_handle,
         },
@@ -869,11 +895,13 @@ fn stop_pty_session(agent_name: &str, sessions: &Arc<Mutex<HashMap<String, PtySe
 fn spawn_history_reader(
     fd: i32,
     history: Arc<Mutex<VecDeque<u8>>>,
+    terminal_snapshot: Arc<Mutex<TerminalSnapshot>>,
     subscribers: Arc<Mutex<Vec<UnixStream>>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let mut buffer = [0u8; 4096];
+        let mut parser = Parser::new();
         loop {
             match file.read(&mut buffer) {
                 Ok(0) => break,
@@ -883,9 +911,15 @@ fn spawn_history_reader(
                         for byte in &buffer[..size] {
                             history.push_back(*byte);
                         }
-                        while history.len() > HISTORY_LIMIT_BYTES {
-                            history.pop_front();
-                        }
+                        trim_history_to_boundary(&mut history, HISTORY_LIMIT_BYTES);
+                    }
+                    {
+                        let mut snapshot = terminal_snapshot
+                            .lock()
+                            .expect("pty terminal snapshot lock");
+                        parser.parse(&buffer[..size], |action| {
+                            apply_action_to_snapshot(action, &mut snapshot);
+                        });
                     }
                     let mut subs = subscribers.lock().expect("pty subscribers lock");
                     subs.retain_mut(|stream| stream.write_all(&buffer[..size]).is_ok());
@@ -895,6 +929,252 @@ fn spawn_history_reader(
             }
         }
     })
+}
+
+fn default_terminal_snapshot() -> TerminalSnapshot {
+    TerminalSnapshot {
+        cursor_visible: true,
+        wrap_mode: true,
+        ..TerminalSnapshot::default()
+    }
+}
+
+fn trim_history_to_boundary(history: &mut VecDeque<u8>, limit: usize) {
+    if history.len() <= limit {
+        return;
+    }
+    let overflow = history.len() - limit;
+    let bytes: Vec<u8> = history.iter().copied().collect();
+    let drop_count = find_safe_history_start(&bytes, overflow);
+    for _ in 0..drop_count {
+        history.pop_front();
+    }
+}
+
+fn find_safe_history_start(bytes: &[u8], overflow: usize) -> usize {
+    let mut index = 0;
+    let mut last_safe = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            if let Some(next) = bytes.get(index + 1).copied() {
+                match next {
+                    b'[' => {
+                        index = parse_csi_sequence(bytes, index + 2);
+                    }
+                    b']' | b'P' | b'^' | b'_' => {
+                        index = parse_string_sequence(bytes, index + 2);
+                    }
+                    _ => {
+                        index = (index + 2).min(bytes.len());
+                    }
+                }
+            } else {
+                break;
+            }
+        } else {
+            index += 1;
+        }
+        if index <= overflow {
+            last_safe = index;
+        }
+    }
+    last_safe
+}
+
+fn parse_csi_sequence(bytes: &[u8], start: usize) -> usize {
+    let mut index = start;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        index += 1;
+        if (0x40..=0x7e).contains(&byte) {
+            break;
+        }
+    }
+    index
+}
+
+fn parse_string_sequence(bytes: &[u8], start: usize) -> usize {
+    let mut index = start;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == 0x07 {
+            return index + 1;
+        }
+        if byte == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+            return index + 2;
+        }
+        index += 1;
+    }
+    index
+}
+
+fn apply_action_to_snapshot(action: Action, snapshot: &mut TerminalSnapshot) {
+    match action {
+        Action::CSI(csi) => apply_csi_to_snapshot(csi, snapshot),
+        Action::Esc(esc) => apply_esc_to_snapshot(esc, snapshot),
+        _ => {}
+    }
+}
+
+fn apply_esc_to_snapshot(esc: Esc, snapshot: &mut TerminalSnapshot) {
+    if let Esc::Code(code) = esc {
+        if matches!(code, EscCode::FullReset) {
+            *snapshot = default_terminal_snapshot();
+        }
+    }
+}
+
+fn apply_csi_to_snapshot(csi: termwiz::escape::csi::CSI, snapshot: &mut TerminalSnapshot) {
+    match csi {
+        termwiz::escape::csi::CSI::Mode(mode) => apply_mode_to_snapshot(mode, snapshot),
+        termwiz::escape::csi::CSI::Sgr(sgr) => apply_sgr_to_snapshot(sgr, snapshot),
+        termwiz::escape::csi::CSI::Cursor(cursor) => apply_cursor_to_snapshot(cursor, snapshot),
+        _ => {}
+    }
+}
+
+fn apply_cursor_to_snapshot(cursor: Cursor, snapshot: &mut TerminalSnapshot) {
+    match cursor {
+        Cursor::SetTopAndBottomMargins { top, bottom } => {
+            let top = top.as_zero_based() as usize;
+            let bottom = bottom.as_zero_based() as usize;
+            if top < bottom {
+                snapshot.scroll_region = Some(ScrollRegion { top, bottom });
+            } else {
+                snapshot.scroll_region = None;
+            }
+        }
+        Cursor::CursorStyle(style) => {
+            snapshot.cursor_shape = match style {
+                CursorStyle::Default => CursorShape::Default,
+                CursorStyle::BlinkingBlock => CursorShape::BlinkingBlock,
+                CursorStyle::SteadyBlock => CursorShape::SteadyBlock,
+                CursorStyle::BlinkingUnderline => CursorShape::BlinkingUnderline,
+                CursorStyle::SteadyUnderline => CursorShape::SteadyUnderline,
+                CursorStyle::BlinkingBar => CursorShape::BlinkingBar,
+                CursorStyle::SteadyBar => CursorShape::SteadyBar,
+            };
+        }
+        _ => {}
+    }
+}
+
+fn apply_mode_to_snapshot(mode: Mode, snapshot: &mut TerminalSnapshot) {
+    match mode {
+        Mode::SetDecPrivateMode(mode) => apply_dec_private_mode(mode, snapshot, true),
+        Mode::ResetDecPrivateMode(mode) => apply_dec_private_mode(mode, snapshot, false),
+        Mode::SetMode(mode) => apply_terminal_mode(mode, snapshot, true),
+        Mode::ResetMode(mode) => apply_terminal_mode(mode, snapshot, false),
+        _ => {}
+    }
+}
+
+fn apply_dec_private_mode(mode: DecPrivateMode, snapshot: &mut TerminalSnapshot, enabled: bool) {
+    let code = match mode {
+        DecPrivateMode::Code(code) => code,
+        DecPrivateMode::Unspecified(code) => {
+            set_mode_entry(&mut snapshot.dec_private_modes, code, enabled);
+            return;
+        }
+    };
+    if let Some(value) = code.to_u16() {
+        set_mode_entry(&mut snapshot.dec_private_modes, value, enabled);
+    }
+    match code {
+        DecPrivateModeCode::ShowCursor => snapshot.cursor_visible = enabled,
+        DecPrivateModeCode::StartBlinkingCursor => {
+            if enabled {
+                snapshot.cursor_shape = CursorShape::BlinkingBlock;
+            }
+        }
+        DecPrivateModeCode::OriginMode => snapshot.origin_mode = enabled,
+        DecPrivateModeCode::AutoWrap => snapshot.wrap_mode = enabled,
+        DecPrivateModeCode::ClearAndEnableAlternateScreen
+        | DecPrivateModeCode::EnableAlternateScreen
+        | DecPrivateModeCode::OptEnableAlternateScreen => snapshot.alt_screen = enabled,
+        DecPrivateModeCode::MouseTracking => snapshot.mouse_tracking = enabled,
+        DecPrivateModeCode::ButtonEventMouse => snapshot.mouse_button_tracking = enabled,
+        DecPrivateModeCode::AnyEventMouse => snapshot.mouse_any_event = enabled,
+        DecPrivateModeCode::SGRMouse => snapshot.mouse_sgr = enabled,
+        _ => {}
+    }
+}
+
+fn apply_terminal_mode(mode: TerminalMode, snapshot: &mut TerminalSnapshot, enabled: bool) {
+    let code = match mode {
+        TerminalMode::Code(code) => code,
+        TerminalMode::Unspecified(code) => {
+            set_mode_entry(&mut snapshot.terminal_modes, code, enabled);
+            return;
+        }
+    };
+    if let Some(value) = code.to_u16() {
+        set_mode_entry(&mut snapshot.terminal_modes, value, enabled);
+    }
+    match code {
+        TerminalModeCode::Insert => snapshot.insert_mode = enabled,
+        TerminalModeCode::ShowCursor => snapshot.cursor_visible = enabled,
+        _ => {}
+    }
+}
+
+fn apply_sgr_to_snapshot(sgr: Sgr, snapshot: &mut TerminalSnapshot) {
+    match sgr {
+        Sgr::Reset => snapshot.attributes = TerminalAttributes::default(),
+        Sgr::Intensity(value) => {
+            snapshot.attributes.intensity = match value {
+                termwiz::cell::Intensity::Normal => TerminalIntensity::Normal,
+                termwiz::cell::Intensity::Bold => TerminalIntensity::Bold,
+                termwiz::cell::Intensity::Half => TerminalIntensity::Faint,
+            };
+        }
+        Sgr::Underline(value) => {
+            snapshot.attributes.underline = match value {
+                termwiz::cell::Underline::None => TerminalUnderline::None,
+                termwiz::cell::Underline::Single => TerminalUnderline::Single,
+                termwiz::cell::Underline::Double => TerminalUnderline::Double,
+                _ => TerminalUnderline::Single,
+            };
+        }
+        Sgr::Blink(value) => {
+            snapshot.attributes.blink = match value {
+                termwiz::cell::Blink::None => TerminalBlink::None,
+                termwiz::cell::Blink::Slow => TerminalBlink::Slow,
+                termwiz::cell::Blink::Rapid => TerminalBlink::Rapid,
+            };
+        }
+        Sgr::Italic(value) => snapshot.attributes.italic = value,
+        Sgr::Inverse(value) => snapshot.attributes.inverse = value,
+        Sgr::Invisible(value) => snapshot.attributes.hidden = value,
+        Sgr::StrikeThrough(value) => snapshot.attributes.strikethrough = value,
+        Sgr::Foreground(color) => {
+            snapshot.attributes.foreground = color_to_snapshot(color.into());
+        }
+        Sgr::Background(color) => {
+            snapshot.attributes.background = color_to_snapshot(color.into());
+        }
+        _ => {}
+    }
+}
+
+fn color_to_snapshot(color: termwiz::color::ColorAttribute) -> TerminalColor {
+    match color {
+        termwiz::color::ColorAttribute::Default => TerminalColor::Default,
+        termwiz::color::ColorAttribute::TrueColorWithDefaultFallback(color)
+        | termwiz::color::ColorAttribute::TrueColorWithPaletteFallback(color, _) => {
+            let (r, g, b, _) = color.as_rgba_u8();
+            TerminalColor::Rgb { r, g, b }
+        }
+        termwiz::color::ColorAttribute::PaletteIndex(index) => TerminalColor::Ansi(index),
+    }
+}
+
+fn set_mode_entry(entries: &mut Vec<ModeEntry>, code: u16, enabled: bool) {
+    if let Some(entry) = entries.iter_mut().find(|entry| entry.code == code) {
+        entry.enabled = enabled;
+    } else {
+        entries.push(ModeEntry { code, enabled });
+    }
 }
 
 fn delete_worktree(
@@ -1002,5 +1282,21 @@ mod tests {
     fn kebab_cases_agent_names() {
         assert_eq!(to_kebab("Wild_Cat"), "wild-cat");
         assert_eq!(to_kebab("Blue Fox"), "blue-fox");
+    }
+
+    #[test]
+    fn history_trim_avoids_mid_sequence_cut() {
+        let history = b"hello\x1b[31mworld";
+        let overflow = 7;
+        let start = find_safe_history_start(history, overflow);
+        assert_eq!(start, 5);
+    }
+
+    #[test]
+    fn history_trim_allows_plain_cut() {
+        let history = b"hello world";
+        let overflow = 3;
+        let start = find_safe_history_start(history, overflow);
+        assert_eq!(start, 3);
     }
 }

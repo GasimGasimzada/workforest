@@ -1,5 +1,5 @@
 use crate::theme::THEME;
-use crate::{delete_agent, App, DeleteAgentAction};
+use crate::{restart_agent, App, RestartAgentAction};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
@@ -12,41 +12,42 @@ use termwiz::input::{KeyCode, KeyEvent};
 
 use super::Window;
 
-pub struct DeleteAgentWindow;
+pub struct RestartAgentWindow;
 
-impl Window for DeleteAgentWindow {
+impl Window for RestartAgentWindow {
     fn render(frame: &mut Frame, app: &mut App, area: Rect) {
-        render_delete_agent_window(frame, app, area);
+        render_restart_agent_window(frame, app, area);
     }
 
     fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
-        handle_delete_agent_keys(app, key)
+        handle_restart_agent_keys(app, key)
     }
 }
 
-fn handle_delete_agent_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
+fn handle_restart_agent_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
     match key.key {
         KeyCode::Escape => {
             app.focused_window = None;
-            app.delete_agent = None;
+            app.restart_agent = None;
         }
         KeyCode::Tab | KeyCode::LeftArrow | KeyCode::RightArrow => {
-            app.delete_agent_action = match app.delete_agent_action {
-                DeleteAgentAction::Cancel => DeleteAgentAction::Delete,
-                DeleteAgentAction::Delete => DeleteAgentAction::Cancel,
+            app.restart_agent_action = match app.restart_agent_action {
+                RestartAgentAction::Cancel => RestartAgentAction::Restart,
+                RestartAgentAction::Restart => RestartAgentAction::Cancel,
             };
         }
-        KeyCode::Enter => match app.delete_agent_action {
-            DeleteAgentAction::Cancel => {
+        KeyCode::Enter => match app.restart_agent_action {
+            RestartAgentAction::Cancel => {
                 app.focused_window = None;
-                app.delete_agent = None;
+                app.restart_agent = None;
             }
-            DeleteAgentAction::Delete => {
-                if let Some(target) = app.delete_agent.take() {
-                    match delete_agent(&app.client, &app.server_url, &target.name) {
+            RestartAgentAction::Restart => {
+                if let Some(target) = app.restart_agent.take() {
+                    match restart_agent(&app.client, &app.server_url, &target.name) {
                         Ok(()) => {
-                            app.refresh_data();
-                            app.set_status(format!("deleted agent {}", target.label));
+                            app.pty_views.remove(&target.name);
+                            app.pending_pty.remove(&target.name);
+                            app.set_status(format!("restarted agent {}", target.label));
                         }
                         Err(err) => app.set_status(err),
                     }
@@ -60,9 +61,9 @@ fn handle_delete_agent_keys(app: &mut App, key: KeyEvent) -> Result<bool, Box<dy
     Ok(false)
 }
 
-fn render_delete_agent_window(frame: &mut Frame, app: &App, base: Rect) {
+fn render_restart_agent_window(frame: &mut Frame, app: &App, base: Rect) {
     let label = app
-        .delete_agent
+        .restart_agent
         .as_ref()
         .map(|agent| agent.label.as_str())
         .unwrap_or("agent");
@@ -72,7 +73,7 @@ fn render_delete_agent_window(frame: &mut Frame, app: &App, base: Rect) {
     let block = Block::bordered()
         .title(
             Line::from(vec![
-                Span::raw("Delete agent "),
+                Span::raw("Restart agent "),
                 Span::styled(label, Style::default().fg(THEME.orange)).add_modifier(Modifier::BOLD),
                 Span::raw("?"),
             ])
@@ -85,7 +86,7 @@ fn render_delete_agent_window(frame: &mut Frame, app: &App, base: Rect) {
 
     let inner = block.inner(area);
 
-    let text = "This will close its session, delete the worktree, and delete the agent.";
+    let text = "This will close its session and start a fresh one.";
     let sections = Layout::vertical([
         Constraint::Length(4),
         Constraint::Length(3),
@@ -103,7 +104,7 @@ fn render_delete_agent_window(frame: &mut Frame, app: &App, base: Rect) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(sections[1]);
 
-    let cancel_selected = matches!(app.delete_agent_action, DeleteAgentAction::Cancel);
+    let cancel_selected = matches!(app.restart_agent_action, RestartAgentAction::Cancel);
     let cancel_button_style = if cancel_selected {
         THEME.fg
     } else {
@@ -119,20 +120,20 @@ fn render_delete_agent_window(frame: &mut Frame, app: &App, base: Rect) {
         .block(cancel_block);
     frame.render_widget(cancel_button, button_layout[0]);
 
-    let delete_selected = matches!(app.delete_agent_action, DeleteAgentAction::Delete);
-    let delete_button_style = if delete_selected {
-        THEME.red
+    let restart_selected = matches!(app.restart_agent_action, RestartAgentAction::Restart);
+    let restart_button_style = if restart_selected {
+        THEME.orange
     } else {
         THEME.fg_mid
     };
-    let delete_block = Block::bordered()
-        .style(Style::default().bg(THEME.bg_alt2).fg(delete_button_style))
-        .border_style(Style::default().fg(delete_button_style));
-    let delete_button = Paragraph::new("Delete")
-        .style(Style::default().fg(delete_button_style))
+    let restart_block = Block::bordered()
+        .style(Style::default().bg(THEME.bg_alt2).fg(restart_button_style))
+        .border_style(Style::default().fg(restart_button_style));
+    let restart_button = Paragraph::new("Restart")
+        .style(Style::default().fg(restart_button_style))
         .alignment(Alignment::Center)
-        .block(delete_block);
-    frame.render_widget(delete_button, button_layout[1]);
+        .block(restart_block);
+    frame.render_widget(restart_button, button_layout[1]);
 
     let hint = Paragraph::new("Tab or arrow keys to switch, Enter to confirm, Esc to cancel.")
         .wrap(Wrap { trim: true })
