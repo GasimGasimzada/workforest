@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Verify tag matches workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          workspace_version=$(python - <<'PY'
+          import tomllib
+          with open('Cargo.toml', 'rb') as f:
+              data = tomllib.load(f)
+          print(data['workspace']['package']['version'])
+          PY
+          )
+          if [ "$tag_version" != "$workspace_version" ]; then
+            echo "Tag version ($tag_version) does not match workspace version ($workspace_version)."
+            exit 1
+          fi
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p workforest \
+            -p workforest-server \
+            -p workforest-tui
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          target="${{ matrix.target }}"
+          release_dir="workforest-${tag}"
+          mkdir -p "$release_dir"
+          cp "target/${target}/release/workforest" "$release_dir/"
+          cp "target/${target}/release/workforest-server" "$release_dir/"
+          cp "target/${target}/release/workforest-tui" "$release_dir/"
+          tarball="workforest-${tag}-${target}.tar.gz"
+          tar -czf "$tarball" "$release_dir"
+          sha_file="workforest-${tag}-${target}.sha256"
+          TARBALL="$tarball" SHA_FILE="$sha_file" python - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+
+          tarball = pathlib.Path(os.environ["TARBALL"])
+          sha_file = pathlib.Path(os.environ["SHA_FILE"])
+          sha = hashlib.sha256(tarball.read_bytes()).hexdigest()
+          sha_file.write_text(f"{sha}  {tarball.name}\n")
+          PY
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            workforest-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            workforest-${{ github.ref_name }}-${{ matrix.target }}.sha256
