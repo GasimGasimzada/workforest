@@ -24,6 +24,7 @@ pub const THEME: Theme = Theme {
     visual: Color::Rgb(42, 42, 42),
 };
 
+#[allow(dead_code)]
 pub struct Theme {
     pub bg: Color,
     pub bg_alt: Color,

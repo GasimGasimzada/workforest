@@ -1,7 +1,29 @@
 use crossterm::terminal;
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::unistd::{close, pipe2, read, write};
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "illumos",
+    target_os = "solaris",
+)))]
+use nix::unistd::pipe;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "illumos",
+    target_os = "solaris",
+))]
+use nix::unistd::pipe2;
+use nix::unistd::{close, read};
 use polling::{Event, Events, PollMode, Poller};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::low_level::pipe::register;
@@ -13,7 +35,6 @@ use termwiz::input::{InputEvent, InputParser};
 
 const STDIN_KEY: usize = 0;
 const SIGWINCH_KEY: usize = 1;
-const WAKE_KEY: usize = 2;
 
 pub struct UIEvent {
     pub raw: Vec<u8>,
@@ -28,8 +49,6 @@ pub struct EventLoop {
     stdin_fd: RawFd,
     sigwinch_read: RawFd,
     sigwinch_write: RawFd,
-    wake_read: RawFd,
-    wake_write: RawFd,
 }
 
 impl EventLoop {
@@ -39,14 +58,8 @@ impl EventLoop {
         let stdin_fd = io::stdin().as_raw_fd();
         set_nonblocking(stdin_fd)?;
 
-        let (sigwinch_read, sigwinch_write) = pipe2(OFlag::O_NONBLOCK).map_err(to_io_error)?;
-        let sigwinch_read = sigwinch_read.into_raw_fd();
-        let sigwinch_write = sigwinch_write.into_raw_fd();
+        let (sigwinch_read, sigwinch_write) = create_nonblocking_pipe()?;
         register(SIGWINCH, sigwinch_write)?;
-
-        let (wake_read, wake_write) = pipe2(OFlag::O_NONBLOCK).map_err(to_io_error)?;
-        let wake_read = wake_read.into_raw_fd();
-        let wake_write = wake_write.into_raw_fd();
 
         unsafe {
             poller.add_with_mode(stdin_fd, Event::readable(STDIN_KEY), PollMode::Level)?;
@@ -55,7 +68,6 @@ impl EventLoop {
                 Event::readable(SIGWINCH_KEY),
                 PollMode::Level,
             )?;
-            poller.add_with_mode(wake_read, Event::readable(WAKE_KEY), PollMode::Level)?;
         }
 
         Ok(Self {
@@ -66,8 +78,6 @@ impl EventLoop {
             stdin_fd,
             sigwinch_read,
             sigwinch_write,
-            wake_read,
-            wake_write,
         })
     }
 
@@ -93,19 +103,11 @@ impl EventLoop {
                     let events = self.handle_sigwinch()?;
                     self.queue.extend(events);
                 }
-                WAKE_KEY => {
-                    let events = self.handle_wake()?;
-                    self.queue.extend(events);
-                }
                 _ => {}
             }
         }
 
         Ok(self.queue.pop_front())
-    }
-
-    pub fn wake(&self) -> io::Result<()> {
-        write_pipe(self.wake_write)
     }
 
     fn read_stdin_events(&mut self) -> io::Result<Vec<UIEvent>> {
@@ -134,14 +136,6 @@ impl EventLoop {
             },
         }])
     }
-
-    fn handle_wake(&mut self) -> io::Result<Vec<UIEvent>> {
-        drain_pipe(self.wake_read)?;
-        Ok(vec![UIEvent {
-            raw: Vec::new(),
-            event: InputEvent::Wake,
-        }])
-    }
 }
 
 impl Drop for EventLoop {
@@ -151,12 +145,9 @@ impl Drop for EventLoop {
             let _ = self
                 .poller
                 .delete(BorrowedFd::borrow_raw(self.sigwinch_read));
-            let _ = self.poller.delete(BorrowedFd::borrow_raw(self.wake_read));
         }
         let _ = close(self.sigwinch_read);
         let _ = close(self.sigwinch_write);
-        let _ = close(self.wake_read);
-        let _ = close(self.wake_write);
     }
 }
 
@@ -165,6 +156,42 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
     fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(to_io_error)?;
     Ok(())
+}
+
+fn create_nonblocking_pipe() -> io::Result<(RawFd, RawFd)> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))]
+    {
+        let (read_fd, write_fd) = pipe2(OFlag::O_NONBLOCK).map_err(to_io_error)?;
+        return Ok((read_fd.into_raw_fd(), write_fd.into_raw_fd()));
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    )))]
+    {
+        let (read_fd, write_fd) = pipe().map_err(to_io_error)?;
+        let read_fd = read_fd.into_raw_fd();
+        let write_fd = write_fd.into_raw_fd();
+        set_nonblocking(read_fd)?;
+        set_nonblocking(write_fd)?;
+        Ok((read_fd, write_fd))
+    }
 }
 
 fn read_pipe(fd: RawFd) -> io::Result<Vec<u8>> {
@@ -184,15 +211,6 @@ fn read_pipe(fd: RawFd) -> io::Result<Vec<u8>> {
 fn drain_pipe(fd: RawFd) -> io::Result<()> {
     let _ = read_pipe(fd)?;
     Ok(())
-}
-
-fn write_pipe(fd: RawFd) -> io::Result<()> {
-    let buffer = [0u8; 1];
-    match write(unsafe { BorrowedFd::borrow_raw(fd) }, &buffer) {
-        Ok(_) => Ok(()),
-        Err(Errno::EAGAIN) => Ok(()),
-        Err(err) => Err(to_io_error(err)),
-    }
 }
 
 fn to_io_error(err: Errno) -> io::Error {

@@ -312,8 +312,9 @@ impl Widget for TermwizPreview<'_> {
         let height = area.height as usize;
         for y in 0..height {
             for x in 0..width {
-                let cell = buf.get_mut(area.x + x as u16, area.y + y as u16);
-                cell.set_symbol(" ");
+                if let Some(cell) = buf.cell_mut((area.x + x as u16, area.y + y as u16)) {
+                    cell.set_symbol(" ");
+                }
             }
         }
         for (row, line) in self.lines.into_iter().take(height).enumerate() {
@@ -325,18 +326,22 @@ impl Widget for TermwizPreview<'_> {
                 let symbol = cell.str();
                 let attrs = cell.attrs();
                 let style = termwiz_style_to_ratatui(attrs);
-                let cell_buf = buf.get_mut(area.x + col as u16, area.y + row as u16);
-                cell_buf.set_symbol(symbol);
-                cell_buf.set_style(style);
+                if let Some(cell_buf) = buf.cell_mut((area.x + col as u16, area.y + row as u16)) {
+                    cell_buf.set_symbol(symbol);
+                    cell_buf.set_style(style);
+                }
             }
         }
 
         if let Some((cursor_x, cursor_y)) = self.cursor_pos {
             if cursor_x < width && cursor_y < height {
-                let cursor_cell = buf.get_mut(area.x + cursor_x as u16, area.y + cursor_y as u16);
-                let mut style = cursor_cell.style();
-                style = style.add_modifier(Modifier::REVERSED);
-                cursor_cell.set_style(style);
+                if let Some(cursor_cell) =
+                    buf.cell_mut((area.x + cursor_x as u16, area.y + cursor_y as u16))
+                {
+                    let mut style = cursor_cell.style();
+                    style = style.add_modifier(Modifier::REVERSED);
+                    cursor_cell.set_style(style);
+                }
             }
         }
     }
